@@ -1,8 +1,8 @@
 package main
 
 import (
-	"comwrapper"
 	"bufio"
+	"comwrapper"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,21 +19,20 @@ import (
 	"unsafe"
 
 	"git.iflytek.com/AIaaS/xsf/utils"
-	"github.com/whybeyoung/go-openai"
 )
 
 var (
-	wLogger       *utils.Logger
-	logLevel      = "debug"
-	logCount      = 10
-	logSize       = 30
-	logAsync      = true
-	logPath       = "/log/app/wrapper.log"
-	respKey       = "content"
-	requestManager *RequestManager
-	httpServerPort int
-	isDecodeMode  bool  // 添加全局变量存储PD模式
-	promptSearchTemplate string  // 添加全局变量存储搜索模板
+	wLogger              *utils.Logger
+	logLevel             = "debug"
+	logCount             = 10
+	logSize              = 30
+	logAsync             = true
+	logPath              = "/log/app/wrapper.log"
+	respKey              = "content"
+	requestManager       *RequestManager
+	httpServerPort       int
+	isDecodeMode         bool   // 添加全局变量存储PD模式
+	promptSearchTemplate string // 添加全局变量存储搜索模板
 )
 
 // RequestManager 请求管理器
@@ -213,7 +212,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			fmt.Println( scanner.Text())
+			fmt.Println(scanner.Text())
 		}
 	}()
 
@@ -299,7 +298,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		firstFrame: true,
 		callback:   cb,
 		params:     params,
-		active:     true,  // 初始化active为true
+		active:     true, // 初始化active为true
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -375,10 +374,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		// 创建kv_info响应
 		kvInfo := map[string]interface{}{
-			"bootstrap_ip":    pdInfo.BootstrapIP,
-			"bootstrap_room":  pdInfo.BootstrapRoom,
-			"prefill_addr":    pdInfo.PrefillAddr,
-			"bootstrap_port":  pdInfo.BootstrapPort,
+			"bootstrap_ip":   pdInfo.BootstrapIP,
+			"bootstrap_room": pdInfo.BootstrapRoom,
+			"prefill_addr":   pdInfo.PrefillAddr,
+			"bootstrap_port": pdInfo.BootstrapPort,
 		}
 
 		data, err := json.Marshal(kvInfo)
@@ -457,7 +456,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		}
 	}
 
-
 	for _, v := range req {
 		if v.Key == "__kv_info" {
 			continue // 跳过kv_info数据
@@ -508,7 +506,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite starting stream inference", "sid", inst.sid)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30 *time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
 			stream, err := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
@@ -622,7 +620,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							return
 						}
 
-
 						// 添加content数据
 						content := comwrapper.WrapperData{
 							Key:      "content",
@@ -645,7 +642,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							lastRst := map[string]interface{}{
 								"choices": []map[string]interface{}{
 									{
-										"content": ""
+										"content": "",
 										"index":   index,
 										"role":    "assistant",
 									},
@@ -710,13 +707,13 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	inst.active = false
 	inst.stopQ <- true
 
-
 	return nil
 }
 
 func WrapperRead(hdl unsafe.Pointer) (respData []comwrapper.WrapperData, err error) {
 	return
 }
+
 // WrapperFini 插件资源销毁
 func WrapperFini() (err error) {
 	return
@@ -853,6 +850,7 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
 	return nil, nil
 }
+
 // CircularIDAllocator ID分配器
 type CircularIDAllocator struct {
 	MinID     int64
@@ -940,13 +938,13 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 
 // ChatCompletionRequest 聊天完成请求
 type ChatCompletionRequest struct {
-	Model       string                 `json:"model"`
-	Messages    []Message              `json:"messages"`
-	Temperature float64                `json:"temperature,omitempty"`
-	MaxTokens   int                    `json:"max_tokens,omitempty"`
-	Stream      bool                   `json:"stream,omitempty"`
-	Tools       []Tool                 `json:"tools,omitempty"`
-	ToolChoice  string                 `json:"tool_choice,omitempty"`
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Temperature float64   `json:"temperature,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Stream      bool      `json:"stream,omitempty"`
+	Tools       []Tool    `json:"tools,omitempty"`
+	ToolChoice  string    `json:"tool_choice,omitempty"`
 	// PD相关参数
 	BootstrapHost string `json:"bootstrap_host,omitempty"`
 	BootstrapPort int    `json:"bootstrap_port,omitempty"`
@@ -1006,6 +1004,7 @@ func monitorSubprocess(cmd *exec.Cmd) {
 		wLogger.Debugw("Sglang process exited normally")
 	}
 }
+
 // convertToOpenAIMessages 将自定义Message类型转换为OpenAI的ChatCompletionMessage类型
 func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage {
 	openAIMessages := make([]openai.ChatCompletionMessage, len(messages))
