@@ -1,6 +1,6 @@
 FROM artifacts.iflytek.com/docker-private/aipaas/aiges-build:2.9.11.3 as builder
-ADD gowrapper/wrapper.go /home/AIGES/src/wrapper/
-ADD  gowrapper/go-openai /home/AIGES/src/github.com/whybeyoung/go-openai
+ADD cmd/wrapper.go /home/AIGES/src/wrapper/
+ADD  vendor/go-openai /home/AIGES/src/github.com/whybeyoung/go-openai
 RUN rm -f /home/AIGES/bin/libwrapper.so
 RUN bash /home/AIGES/build.wrapper.sh
 
