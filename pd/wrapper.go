@@ -19,7 +19,6 @@ import (
 	"unsafe"
 
 	"git.iflytek.com/AIaaS/xsf/utils"
-	"github.com/whybeyoung/go-openai"
 )
 
 var (
@@ -89,6 +88,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 		respKey = v
 	}
 
+	// 获取搜索模板
+	if v, ok := cfg["prompt_search_template"]; ok {
+		promptSearchTemplate = v
+	}
+
 	wLogger, err = utils.NewLocalLog(
 		utils.SetAsync(logAsync),
 		utils.SetLevel(logLevel),
@@ -100,8 +104,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 		return fmt.Errorf("loggerErr:%v", err)
 	}
 
-	// 获取搜索模板
-	promptSearchTemplate = os.Getenv("PROMPT_SEARCH_TEMPLATE")
 	if promptSearchTemplate != "" {
 		wLogger.Infow("Using custom prompt search template")
 	} else {
@@ -236,51 +238,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	return
 }
 
-// waitServerReady 等待服务器就绪
-func waitServerReady(serverURL string) error {
-	maxRetries := 3000 // 最多重试30次
-	for i := 0; i < maxRetries; i++ {
-		resp, err := http.Get(serverURL)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			wLogger.Debugw("Server ready", "url", serverURL)
-			resp.Body.Close()
-			return nil
-		}
-
-		if resp != nil {
-			resp.Body.Close()
-		}
-
-		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		time.Sleep(time.Second)
-	}
-	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
-}
-
-// getLocalIP 获取本地IP
-func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
-}
-
-// wrapperInst 结构体定义
-type wrapperInst struct {
-	usrTag     string
-	sid        string
-	client     *OpenAIClient
-	stopQ      chan bool
-	firstFrame bool
-	callback   comwrapper.CallBackPtr
-	params     map[string]string
-	active     bool
-}
-
 // WrapperCreate 插件会话实例创建
 func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb comwrapper.CallBackPtr) (hdl unsafe.Pointer, err error) {
 	sid := params["sid"]
@@ -333,6 +290,51 @@ func getPDInfo() *PDInfo {
 		BootstrapRoom: roomID,
 		PrefillAddr:   prefillAddr,
 	}
+}
+
+// waitServerReady 等待服务器就绪
+func waitServerReady(serverURL string) error {
+	maxRetries := 3000 // 最多重试30次
+	for i := 0; i < maxRetries; i++ {
+		resp, err := http.Get(serverURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			wLogger.Debugw("Server ready", "url", serverURL)
+			resp.Body.Close()
+			return nil
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
+}
+
+// getLocalIP 获取本地IP
+func getLocalIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+// wrapperInst 结构体定义
+type wrapperInst struct {
+	usrTag     string
+	sid        string
+	client     *OpenAIClient
+	stopQ      chan bool
+	firstFrame bool
+	callback   comwrapper.CallBackPtr
+	params     map[string]string
+	active     bool
 }
 
 // WrapperWrite 数据写入
@@ -500,13 +502,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				"bootstrap_port": pdInfo.BootstrapPort,
 				"bootstrap_room": pdInfo.BootstrapRoom,
 				"prefill_addr":   pdInfo.PrefillAddr,
+				"session_params": map[string]interface{}{
+					"rid": inst.sid,
+				},
 			},
 		}
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite starting stream inference", "sid", inst.sid)
-			startTime := time.Now()
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
@@ -681,9 +686,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						Type:     comwrapper.DataText,
 						Status:   comwrapper.DataEnd,
 					}
-					stopTime := time.Now()
-					duration := stopTime.Sub(startTime)
-					wLogger.Debugw("Prefill time Cost ms", "duration", duration.Milliseconds(), "sid", inst.sid)
+
 					if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
 						wLogger.Errorw("WrapperWrite final keepalive_down callback error", "error", err, "sid", inst.sid)
 					} else {
