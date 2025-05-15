@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 	"unsafe"
 
@@ -23,27 +25,27 @@ import (
 )
 
 var (
-	wLogger              *utils.Logger
-	logLevel             = "debug"
-	logCount             = 10
-	logSize              = 30
-	logAsync             = true
-	logPath              = "/log/app/wrapper.log"
-	respKey              = "content"
-	requestManager       *RequestManager
-	httpServerPort       int
-	isDecodeMode         bool   // 添加全局变量存储PD模式
-	isNeedPDInfo         bool   // 不分离不需要PD信息
-	promptSearchTemplate string // 添加全局变量存储搜索模板
-	isReasoningModel     bool
-	pretrainedName       string // 预训练模型名称
-	finetuneType         string // 微调类型
+	wLogger                     *utils.Logger
+	logLevel                    = "debug"
+	logCount                    = 10
+	logSize                     = 30
+	logAsync                    = true
+	logPath                     = "/log/app/wrapper.log"
+	respKey                     = "content"
+	requestManager              *RequestManager
+	httpServerPort              int
+	isDecodeMode                bool   // 添加全局变量存储PD模式
+	isNeedPDInfo                bool   // 不分离不需要PD信息
+	promptSearchTemplate        string // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
+	isReasoningModel            bool
+	pretrainedName              string // 预训练模型名称
+	finetuneType                string // 微调类型
 )
 
 const (
 	R1_THINK_START = "<think>"
 	R1_THINK_END   = "</think>"
-	DateNone       = comwrapper.DataStatus(-1)
 )
 
 // RequestManager 请求管理器
@@ -98,6 +100,20 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if v, ok := cfg["resp_key"]; ok {
 		respKey = v
 	}
+	// 获取搜索模板
+	if v, ok := cfg["prompt_search_template"]; ok {
+		promptSearchTemplate = v
+	}
+	// 获取不带索引的搜索模板
+	if v, ok := cfg["prompt_search_template_no_index"]; ok {
+		promptSearchTemplateNoIndex = v
+	}
+
+	// 创建日志目录
+	logDir := filepath.Dir(logPath)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %v", err)
+	}
 
 	wLogger, err = utils.NewLocalLog(
 		utils.SetAsync(logAsync),
@@ -111,7 +127,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 获取搜索模板
-	promptSearchTemplate = os.Getenv("PROMPT_SEARCH_TEMPLATE")
 	if promptSearchTemplate != "" {
 		wLogger.Infow("Using custom prompt search template")
 	} else {
@@ -416,8 +431,8 @@ func toString(v any) string {
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
 	inst := (*wrapperInst)(hdl)
-	fmt.Printf("WrapperWrite inst:%v\n", toString(inst))
-	fmt.Printf("WrapperWrite req:%v\n", toString(req))
+	debugPrinft("WrapperWrite inst:%v\n", toString(inst))
+	debugPrinft("WrapperWrite req:%v\n", toString(req))
 	if !inst.active {
 		wLogger.Warnw("WrapperWrite called on inactive instance", "sid", inst.sid)
 		return fmt.Errorf("instance is not active")
@@ -487,7 +502,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"topP", topP)
 
 		promptTokensLen, resultTokensLen := 0, 0
-		openaiMsgs := formatMessages(string(v.Data), promptSearchTemplate)
+		openaiMsgs := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 		thinking := false
 		if isReasoningModel {
 			lastMsg := openaiMsgs[len(openaiMsgs)-1]
@@ -512,7 +527,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			},
 			TopP: float32(topP),
 		}
-		fmt.Printf("WrapperWrite streamReq:%v\n", toString(streamReq))
+		debugPrinft("WrapperWrite streamReq:%v\n", toString(streamReq))
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
@@ -532,7 +547,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			index := 0
 			fullContent := ""
 
-			status = DateNone
+			status = comwrapper.DataContinue
 			// 首帧返回空
 			firstFrameContent, err := responseContent(status, index, "", "")
 			if err != nil {
@@ -555,18 +570,12 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 					return
 				default:
-					if status == DateNone {
-						status = comwrapper.DataBegin
-					} else {
-						status = comwrapper.DataContinue
-					}
 					// 创建响应数据切片
 					responseData := make([]comwrapper.WrapperData, 0, 3) // 预分配容量为2
 
 					response, err := stream.Recv()
 
 					if err != nil {
-						fmt.Printf("WrapperWrite stream err:%v\n", err.Error())
 						if err == io.EOF {
 							wLogger.Infow("WrapperWrite stream ended normally", "sid", inst.sid)
 							goto endLoop
@@ -574,7 +583,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						wLogger.Errorw("WrapperWrite read stream error", "error", err, "sid", inst.sid)
 						return
 					}
-					fmt.Printf("WrapperWrite stream resp:%v\n", toString(response))
 
 					// 处理content数据
 					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
@@ -597,7 +605,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							reasoning_last_chunk := chunks[0]
 							answer_start_chunk := chunks[1]
 							reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk)
-							fmt.Printf("WrapperWrite stream response reasoning_last_chunk:%v\n", reasoning_last_chunk_content)
+							debugPrinft("WrapperWrite stream response reasoning_last_chunk:%v\n", reasoning_last_chunk_content)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
@@ -617,7 +625,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								responseError(inst, err)
 								return
 							}
-							fmt.Printf("WrapperWrite stream response answer_start_chunk:%v\n", answer_start_chunk_content)
+							debugPrinft("WrapperWrite stream response answer_start_chunk:%v\n", answer_start_chunk_content)
 							fullContent += answer_start_chunk
 							responseData = []comwrapper.WrapperData{*answer_start_chunk_content}
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
@@ -646,7 +654,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						responseData = append(responseData, *content)
 						fullContent += chunk_content
 						index += 1
-						fmt.Printf("WrapperWrite stream response think:%v, index:%v, responseData:%v\n", thinking, index, toString(responseData))
+						debugPrinft("WrapperWrite stream response think:%v, index:%v, responseData:%v\n", thinking, index, toString(responseData))
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 							return
@@ -658,7 +666,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						// 创建usage数据结构
 						promptTokensLen = response.Usage.PromptTokens
 						resultTokensLen = response.Usage.CompletionTokens
-						fmt.Printf("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v\n", index, promptTokensLen, resultTokensLen)
+						debugPrinft("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v\n", index, promptTokensLen, resultTokensLen)
 						err = responseEnd(inst, index, promptTokensLen, resultTokensLen)
 						if err != nil {
 							return
@@ -692,7 +700,7 @@ func responseError(inst *wrapperInst, err error) {
 		Type:     comwrapper.DataText,
 		Status:   comwrapper.DataEnd,
 	}
-	fmt.Printf("WrapperWrite stream errorContent:%v\n", toString(errorContent))
+	debugPrinft("WrapperWrite stream errorContent:%v\n", toString(errorContent))
 	if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{errorContent}, nil); err != nil {
 		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 	}
@@ -710,7 +718,7 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 		return err
 	}
 	responseData := []comwrapper.WrapperData{*content, *usageWrapperData}
-	fmt.Printf("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v\n", index, prompt_tokens_len, result_tokens_len, toString(responseData))
+	debugPrinft("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v\n", index, prompt_tokens_len, result_tokens_len, toString(responseData))
 	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 		wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 		return err
@@ -785,14 +793,8 @@ func parseMessages(prompt string) []Message {
 		Messages []Message `json:"messages"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &sparkMsg); err == nil {
-		// 过滤掉tool消息
-		var filteredMessages []Message
-		for _, msg := range sparkMsg.Messages {
-			if msg.Role != "tool" {
-				filteredMessages = append(filteredMessages, msg)
-			}
-		}
-		return filteredMessages
+		// 直接返回所有消息，包括tool消息
+		return sparkMsg.Messages
 	}
 
 	// 如果都不是，则作为普通文本处理
@@ -804,11 +806,12 @@ func parseMessages(prompt string) []Message {
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string) []Message {
+func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
 	messages := parseMessages(prompt)
+	debugPrinft("formatMessages messages: %v\n", messages)
 
 	// 如果没有搜索模板，直接返回解析后的消息
-	if promptSearchTemplate == "" {
+	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
 		return messages
 	}
 
@@ -820,6 +823,7 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 			break
 		}
 	}
+	debugPrinft("formatMessages lastToolMsg: %v\n", lastToolMsg)
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
@@ -833,20 +837,32 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 		return messages
 	}
 
+	// 如果没有搜索内容，直接返回
+	if len(searchContent) == 0 {
+		return messages
+	}
+
+	// 获取show_ref_label，默认为false
+	showRefLabel := false
+	if lastToolMsg.ShowRefLabel != nil {
+		showRefLabel = *lastToolMsg.ShowRefLabel
+	}
+
 	// 格式化搜索内容
 	var formattedContent []string
 	for _, content := range searchContent {
-		formattedText := fmt.Sprintf("[webpage %d begin]\n%s%s\n[webpage %d end]",
+		formattedText := fmt.Sprintf("[webpage %v begin]\n%v%v\n[webpage %v end]",
 			content["index"],
 			content["docid"],
 			content["document"],
 			content["index"])
 		formattedContent = append(formattedContent, formattedText)
 	}
+	debugPrinft("formatMessages formattedContent: %v\n", formattedContent)
 
 	// 获取当前日期
 	now := time.Now()
-	weekdays := []string{"一", "二", "三", "四", "五", "六", "日"}
+	weekdays := []string{"日", "一", "二", "三", "四", "五", "六"}
 	currentDate := fmt.Sprintf("%d年%02d月%02d日星期%s",
 		now.Year(), now.Month(), now.Day(), weekdays[now.Weekday()])
 
@@ -854,10 +870,38 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
 			// 应用模板
-			messages[i].Content = fmt.Sprintf(promptSearchTemplate,
-				strings.Join(formattedContent, "\n"),
-				currentDate,
-				messages[i].Content)
+			// 根据show_ref_label选择模板
+			templateStr := promptSearchTemplate
+			if !showRefLabel {
+				templateStr = promptSearchTemplateNoIndex
+			}
+
+			// 创建模板
+			tmpl, err := template.New("search").Parse(templateStr)
+			if err != nil {
+				wLogger.Errorw("Failed to parse template", "error", err)
+				return messages
+			}
+
+			// 准备模板数据
+			data := struct {
+				SearchResults string
+				CurDate       string
+				Question      string
+			}{
+				SearchResults: strings.Join(formattedContent, "\n"),
+				CurDate:       currentDate,
+				Question:      messages[i].Content.(string),
+			}
+
+			// 执行模板渲染
+			var result strings.Builder
+			if err := tmpl.Execute(&result, data); err != nil {
+				wLogger.Errorw("Failed to execute template", "error", err)
+				return messages
+			}
+
+			messages[i].Content = result.String()
 			break
 		}
 	}
@@ -972,8 +1016,9 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
+	Role         string      `json:"role"`
+	Content      interface{} `json:"content"`
+	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
 }
 
 // Tool 工具结构
@@ -1049,4 +1094,10 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 
 func WrapperNotify(res comwrapper.WrapperData) (err error) {
 	return nil
+}
+
+func debugPrinft(format string, a ...any) {
+	if logLevel == "debug" {
+		fmt.Printf(format, a...)
+	}
 }

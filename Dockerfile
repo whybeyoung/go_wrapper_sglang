@@ -1,12 +1,6 @@
-<<<<<<< HEAD
 FROM artifacts.iflytek.com/docker-private/aipaas/aiges-build:2.9.11.6 as builder
 ADD inference_wrapper/wrapper_sglang_openai/wrapper.go /home/AIGES/src/wrapper/
 ADD  vendor/github.com/whybeyoung/go-openai /home/AIGES/src/github.com/whybeyoung/go-openai
-=======
-FROM artifacts.iflytek.com/docker-private/aipaas/aiges-build:2.9.11.3 as builder
-ADD cmd/wrapper.go /home/AIGES/src/wrapper/
-ADD  vendor/go-openai /home/AIGES/src/github.com/whybeyoung/go-openai
->>>>>>> main
 RUN rm -f /home/AIGES/bin/libwrapper.so
 RUN bash /home/AIGES/build.wrapper.sh
 
