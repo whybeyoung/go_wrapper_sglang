@@ -12,28 +12,30 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 	"unsafe"
 
 	"git.iflytek.com/AIaaS/xsf/utils"
-	"github.com/whybeyoung/go-openai"
 )
 
 var (
-	wLogger              *utils.Logger
-	logLevel             = "debug"
-	logCount             = 10
-	logSize              = 30
-	logAsync             = true
-	logPath              = "/log/app/wrapper.log"
-	respKey              = "content"
-	requestManager       *RequestManager
-	httpServerPort       int
-	isDecodeMode         bool   // 添加全局变量存储PD模式
-	promptSearchTemplate string // 添加全局变量存储搜索模板
+	wLogger                     *utils.Logger
+	logLevel                    = "debug"
+	logCount                    = 10
+	logSize                     = 30
+	logAsync                    = true
+	logPath                     = "/log/app/wrapper.log"
+	respKey                     = "content"
+	requestManager              *RequestManager
+	httpServerPort              int
+	isDecodeMode                bool   // 添加全局变量存储PD模式
+	promptSearchTemplate        string // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
 )
 
 // RequestManager 请求管理器
@@ -89,6 +91,22 @@ func WrapperInit(cfg map[string]string) (err error) {
 		respKey = v
 	}
 
+	// 获取搜索模板
+	if v, ok := cfg["prompt_search_template"]; ok {
+		promptSearchTemplate = v
+	}
+
+	// 获取不带索引的搜索模板
+	if v, ok := cfg["prompt_search_template_no_index"]; ok {
+		promptSearchTemplateNoIndex = v
+	}
+
+	// 创建日志目录
+	logDir := filepath.Dir(logPath)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %v", err)
+	}
+
 	wLogger, err = utils.NewLocalLog(
 		utils.SetAsync(logAsync),
 		utils.SetLevel(logLevel),
@@ -100,8 +118,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 		return fmt.Errorf("loggerErr:%v", err)
 	}
 
-	// 获取搜索模板
-	promptSearchTemplate = os.Getenv("PROMPT_SEARCH_TEMPLATE")
 	if promptSearchTemplate != "" {
 		wLogger.Infow("Using custom prompt search template")
 	} else {
@@ -236,51 +252,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	return
 }
 
-// waitServerReady 等待服务器就绪
-func waitServerReady(serverURL string) error {
-	maxRetries := 3000 // 最多重试30次
-	for i := 0; i < maxRetries; i++ {
-		resp, err := http.Get(serverURL)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			wLogger.Debugw("Server ready", "url", serverURL)
-			resp.Body.Close()
-			return nil
-		}
-
-		if resp != nil {
-			resp.Body.Close()
-		}
-
-		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		time.Sleep(time.Second)
-	}
-	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
-}
-
-// getLocalIP 获取本地IP
-func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
-}
-
-// wrapperInst 结构体定义
-type wrapperInst struct {
-	usrTag     string
-	sid        string
-	client     *OpenAIClient
-	stopQ      chan bool
-	firstFrame bool
-	callback   comwrapper.CallBackPtr
-	params     map[string]string
-	active     bool
-}
-
 // WrapperCreate 插件会话实例创建
 func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb comwrapper.CallBackPtr) (hdl unsafe.Pointer, err error) {
 	sid := params["sid"]
@@ -333,6 +304,51 @@ func getPDInfo() *PDInfo {
 		BootstrapRoom: roomID,
 		PrefillAddr:   prefillAddr,
 	}
+}
+
+// waitServerReady 等待服务器就绪
+func waitServerReady(serverURL string) error {
+	maxRetries := 3000 // 最多重试30次
+	for i := 0; i < maxRetries; i++ {
+		resp, err := http.Get(serverURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			wLogger.Debugw("Server ready", "url", serverURL)
+			resp.Body.Close()
+			return nil
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
+}
+
+// getLocalIP 获取本地IP
+func getLocalIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+// wrapperInst 结构体定义
+type wrapperInst struct {
+	usrTag     string
+	sid        string
+	client     *OpenAIClient
+	stopQ      chan bool
+	firstFrame bool
+	callback   comwrapper.CallBackPtr
+	params     map[string]string
+	active     bool
 }
 
 // WrapperWrite 数据写入
@@ -487,7 +503,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 创建流式请求
 		streamReq := &openai.ChatCompletionRequest{
 			Model:       "default",
-			Messages:    convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate)),
+			Messages:    convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)),
 			Temperature: float32(temperature),
 			MaxTokens:   maxTokens,
 			Stream:      true,
@@ -500,13 +516,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				"bootstrap_port": pdInfo.BootstrapPort,
 				"bootstrap_room": pdInfo.BootstrapRoom,
 				"prefill_addr":   pdInfo.PrefillAddr,
+				"session_params": map[string]interface{}{
+					"rid": inst.sid,
+				},
 			},
 		}
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite starting stream inference", "sid", inst.sid)
-			startTime := time.Now()
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
@@ -681,9 +700,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						Type:     comwrapper.DataText,
 						Status:   comwrapper.DataEnd,
 					}
-					stopTime := time.Now()
-					duration := stopTime.Sub(startTime)
-					wLogger.Debugw("Prefill time Cost ms", "duration", duration.Milliseconds(), "sid", inst.sid)
+
 					if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
 						wLogger.Errorw("WrapperWrite final keepalive_down callback error", "error", err, "sid", inst.sid)
 					} else {
@@ -770,14 +787,8 @@ func parseMessages(prompt string) []Message {
 		Messages []Message `json:"messages"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &sparkMsg); err == nil {
-		// 过滤掉tool消息
-		var filteredMessages []Message
-		for _, msg := range sparkMsg.Messages {
-			if msg.Role != "tool" {
-				filteredMessages = append(filteredMessages, msg)
-			}
-		}
-		return filteredMessages
+		// 直接返回所有消息，包括tool消息
+		return sparkMsg.Messages
 	}
 
 	// 如果都不是，则作为普通文本处理
@@ -789,11 +800,11 @@ func parseMessages(prompt string) []Message {
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string) []Message {
+func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
 	messages := parseMessages(prompt)
 
 	// 如果没有搜索模板，直接返回解析后的消息
-	if promptSearchTemplate == "" {
+	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
 		return messages
 	}
 
@@ -818,10 +829,21 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 		return messages
 	}
 
+	// 如果没有搜索内容，直接返回
+	if len(searchContent) == 0 {
+		return messages
+	}
+
+	// 获取show_ref_label，默认为false
+	showRefLabel := false
+	if lastToolMsg.ShowRefLabel != nil {
+		showRefLabel = *lastToolMsg.ShowRefLabel
+	}
+
 	// 格式化搜索内容
 	var formattedContent []string
 	for _, content := range searchContent {
-		formattedText := fmt.Sprintf("[webpage %d begin]\n%s%s\n[webpage %d end]",
+		formattedText := fmt.Sprintf("[webpage %v begin]\n%v%v\n[webpage %v end]",
 			content["index"],
 			content["docid"],
 			content["document"],
@@ -831,18 +853,45 @@ func formatMessages(prompt string, promptSearchTemplate string) []Message {
 
 	// 获取当前日期
 	now := time.Now()
-	weekdays := []string{"一", "二", "三", "四", "五", "六", "日"}
+	weekdays := []string{"日", "一", "二", "三", "四", "五", "六"}
 	currentDate := fmt.Sprintf("%d年%02d月%02d日星期%s",
 		now.Year(), now.Month(), now.Day(), weekdays[now.Weekday()])
 
 	// 查找最后一个用户消息并更新其内容
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
-			// 应用模板
-			messages[i].Content = fmt.Sprintf(promptSearchTemplate,
-				strings.Join(formattedContent, "\n"),
-				currentDate,
-				messages[i].Content)
+			// 根据show_ref_label选择模板
+			templateStr := promptSearchTemplate
+			if !showRefLabel {
+				templateStr = promptSearchTemplateNoIndex
+			}
+
+			// 创建模板
+			tmpl, err := template.New("search").Parse(templateStr)
+			if err != nil {
+				wLogger.Errorw("Failed to parse template", "error", err)
+				return messages
+			}
+
+			// 准备模板数据
+			data := struct {
+				SearchResults string
+				CurDate       string
+				Question      string
+			}{
+				SearchResults: strings.Join(formattedContent, "\n"),
+				CurDate:       currentDate,
+				Question:      messages[i].Content.(string),
+			}
+
+			// 执行模板渲染
+			var result strings.Builder
+			if err := tmpl.Execute(&result, data); err != nil {
+				wLogger.Errorw("Failed to execute template", "error", err)
+				return messages
+			}
+
+			messages[i].Content = result.String()
 			break
 		}
 	}
@@ -957,8 +1006,9 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
+	Role         string      `json:"role"`
+	Content      interface{} `json:"content"`
+	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
 }
 
 // Tool 工具结构
