@@ -431,8 +431,8 @@ func toString(v any) string {
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
 	inst := (*wrapperInst)(hdl)
-	debugPrinft("WrapperWrite inst:%v\n", toString(inst))
-	debugPrinft("WrapperWrite req:%v\n", toString(req))
+	wLogger.Debugw(fmt.Sprintf("WrapperWrite inst:%v\n", toString(inst)))
+	wLogger.Debugw(fmt.Sprintf("WrapperWrite req:%v\n", toString(req)))
 	if !inst.active {
 		wLogger.Warnw("WrapperWrite called on inactive instance", "sid", inst.sid)
 		return fmt.Errorf("instance is not active")
@@ -527,7 +527,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			},
 			TopP: float32(topP),
 		}
-		debugPrinft("WrapperWrite streamReq:%v\n", toString(streamReq))
+		wLogger.Debugw(fmt.Sprintf("WrapperWrite streamReq:%v\n", toString(streamReq)), "sid", inst.sid)
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
@@ -555,6 +555,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				responseError(inst, err)
 				return
 			}
+			wLogger.Debugw(fmt.Sprintf("fisrtFrameContent:%v", toString(firstFrameContent)), "sid", inst.sid)
 			if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{*firstFrameContent}, nil); err != nil {
 				wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 				return
@@ -605,7 +606,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							reasoning_last_chunk := chunks[0]
 							answer_start_chunk := chunks[1]
 							reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk)
-							debugPrinft("WrapperWrite stream response reasoning_last_chunk:%v\n", reasoning_last_chunk_content)
+							wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response reasoning_last_chunk:%v\n", reasoning_last_chunk_content), "sid", inst.sid)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
@@ -625,7 +626,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								responseError(inst, err)
 								return
 							}
-							debugPrinft("WrapperWrite stream response answer_start_chunk:%v\n", answer_start_chunk_content)
+							wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response answer_start_chunk:%v\n", answer_start_chunk_content), "sid", inst.sid)
 							fullContent += answer_start_chunk
 							responseData = []comwrapper.WrapperData{*answer_start_chunk_content}
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
@@ -654,7 +655,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						responseData = append(responseData, *content)
 						fullContent += chunk_content
 						index += 1
-						debugPrinft("WrapperWrite stream response think:%v, index:%v, responseData:%v\n", thinking, index, toString(responseData))
+						wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response think:%v, index:%v, responseData:%v\n", thinking, index, toString(responseData)), "sid", inst.sid)
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 							return
@@ -666,7 +667,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						// 创建usage数据结构
 						promptTokensLen = response.Usage.PromptTokens
 						resultTokensLen = response.Usage.CompletionTokens
-						debugPrinft("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v\n", index, promptTokensLen, resultTokensLen)
+						wLogger.Debugw(fmt.Sprintf("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v\n", index, promptTokensLen, resultTokensLen), "sid", inst.sid)
 						err = responseEnd(inst, index, promptTokensLen, resultTokensLen)
 						if err != nil {
 							return
@@ -700,7 +701,7 @@ func responseError(inst *wrapperInst, err error) {
 		Type:     comwrapper.DataText,
 		Status:   comwrapper.DataEnd,
 	}
-	debugPrinft("WrapperWrite stream errorContent:%v\n", toString(errorContent))
+	wLogger.Debugw(fmt.Sprintf("WrapperWrite stream errorContent:%v\n", toString(errorContent)), "sid", inst.sid)
 	if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{errorContent}, nil); err != nil {
 		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 	}
@@ -718,7 +719,7 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 		return err
 	}
 	responseData := []comwrapper.WrapperData{*content, *usageWrapperData}
-	debugPrinft("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v\n", index, prompt_tokens_len, result_tokens_len, toString(responseData))
+	wLogger.Debugw(fmt.Sprintf("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v\n", index, prompt_tokens_len, result_tokens_len, toString(responseData)), "sid", inst.sid)
 	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 		wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 		return err
@@ -808,7 +809,7 @@ func parseMessages(prompt string) []Message {
 // formatMessages 格式化消息，支持搜索模板
 func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
 	messages := parseMessages(prompt)
-	debugPrinft("formatMessages messages: %v\n", messages)
+	wLogger.Debugw(fmt.Sprintf("formatMessages messages: %v\n", messages))
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
@@ -823,7 +824,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			break
 		}
 	}
-	debugPrinft("formatMessages lastToolMsg: %v\n", lastToolMsg)
+	wLogger.Debugw(fmt.Sprintf("formatMessages lastToolMsg: %v\n", lastToolMsg))
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
@@ -858,7 +859,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			content["index"])
 		formattedContent = append(formattedContent, formattedText)
 	}
-	debugPrinft("formatMessages formattedContent: %v\n", formattedContent)
+	wLogger.Debugw(fmt.Sprintf("formatMessages formattedContent: %v\n", formattedContent))
 
 	// 获取当前日期
 	now := time.Now()
@@ -1094,10 +1095,4 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 
 func WrapperNotify(res comwrapper.WrapperData) (err error) {
 	return nil
-}
-
-func debugPrinft(format string, a ...any) {
-	if logLevel == "debug" {
-		fmt.Printf(format, a...)
-	}
 }
