@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -33,19 +32,26 @@ var (
 	logPath                     = "/log/app/wrapper.log"
 	respKey                     = "content"
 	requestManager              *RequestManager
-	httpServerPort              int
-	isDecodeMode                bool   // 添加全局变量存储PD模式
-	isNeedPDInfo                bool   // 不分离不需要PD信息
+	httpServerPort              = 40000
+	streamContextTimeoutSeconds = 1800 * time.Second
+	temperature                 = 0.95
+	maxTokens                   = 2048
+	topP                        = 0.95
 	promptSearchTemplate        string // 添加全局变量存储搜索模板
 	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
 	isReasoningModel            bool
-	pretrainedName              string // 预训练模型名称
-	finetuneType                string // 微调类型
+	cmd                         *exec.Cmd
 )
 
+var traceFunc func(usrTag string, key string, value string) (code int)
+var meterFunc func(usrTag string, key string, count int) (code int)
+
 const (
-	R1_THINK_START = "<think>"
-	R1_THINK_END   = "</think>"
+	R1_THINK_START              = "<think>"
+	R1_THINK_END                = "</think>"
+	HTTP_SERVER_REQUEST_TIMEOUT = time.Second * 10
+	HTTP_SERVER_MAX_RETRY_TIME  = time.Minute * 30
+	STREAM_CONNECT_TIMEOUT      = "stream connect timeout"
 )
 
 // RequestManager 请求管理器
@@ -53,7 +59,6 @@ type RequestManager struct {
 	Client      *OpenAIClient
 	Logger      *utils.Logger
 	RequestLock sync.RWMutex
-	IDAllocator *CircularIDAllocator
 }
 
 // NewRequestManager 创建请求管理器
@@ -70,9 +75,8 @@ func NewRequestManager(client *OpenAIClient) *RequestManager {
 	}
 
 	return &RequestManager{
-		Client:      client,
-		Logger:      logger,
-		IDAllocator: NewCircularIDAllocator("", 0),
+		Client: client,
+		Logger: logger,
 	}
 }
 
@@ -108,6 +112,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if v, ok := cfg["prompt_search_template_no_index"]; ok {
 		promptSearchTemplateNoIndex = v
 	}
+	if v, ok := cfg["stream_context_timeout_seconds"]; ok {
+		if t, err := strconv.ParseInt(v, 10, 64); err == nil {
+			streamContextTimeoutSeconds = time.Second * time.Duration(t)
+		}
+	}
 
 	// 创建日志目录
 	logDir := filepath.Dir(logPath)
@@ -125,6 +134,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if err != nil {
 		return fmt.Errorf("loggerErr:%v", err)
 	}
+	wLogger.Debugf("wrapper config:%v", cfg)
 
 	// 获取搜索模板
 	if promptSearchTemplate != "" {
@@ -135,14 +145,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 从环境变量获取配置
 	baseModel := os.Getenv("FULL_MODEL_PATH")
-	pretrainedName = os.Getenv("PRETRAINED_MODEL_NAME")
-	if pretrainedName == "" {
-		return fmt.Errorf("PRETRAINED_MODEL_NAME is not set")
-	}
-	finetuneType = os.Getenv("FINETUNE_TYPE")
-	if finetuneType == "" {
-		finetuneType = "lora"
-	}
+
 	isReasoningModelStr := os.Getenv("IS_REASONING_MODEL")
 	if isReasoningModelStr == "true" {
 		isReasoningModel = true
@@ -150,15 +153,14 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 获取端口配置
 	port := os.Getenv("HTTP_SERVER_PORT")
-	if port == "" {
-		port = "40000"
+	if port != "" {
+		httpServerPort, _ = strconv.Atoi(port)
 	}
-	httpServerPort, _ = strconv.Atoi(port)
 
 	// 获取额外参数
 	extraArgs := os.Getenv("CMD_EXTRA_ARGS")
 	if extraArgs == "" {
-		extraArgs = "--tp 8 --mem-fraction-static 0.93 --torch-compile-max-bs 8 --max-running-requests 20"
+		extraArgs = "--mem-fraction-static 0.93 --torch-compile-max-bs 8 --max-running-requests 20"
 		wLogger.Infow("Using default CMD_ARGS", "args", extraArgs)
 	} else {
 		wLogger.Infow("Using custom CMD_ARGS", "args", extraArgs)
@@ -169,22 +171,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
 		wLogger.Infow("Metrics enabled")
-	}
-
-	// 检查PD模式
-	pdType := os.Getenv("AIGES_PD_ROLE")
-	isDecodeMode = true // 默认为decode模式
-	isNeedPDInfo = true // 默认位需要PD信息
-	if pdType == "prefill" {
-		isDecodeMode = false
-		extraArgs += " --disaggregation-mode prefill"
-		wLogger.Infow("Running in prefill mode")
-	} else if pdType == "decode" {
-		extraArgs += " --disaggregation-mode decode"
-		wLogger.Infow("Running in decode mode")
-	} else {
-		isNeedPDInfo = false
-		wLogger.Infow("Running in prefill-decode mode")
 	}
 
 	// 检查多节点模式
@@ -225,7 +211,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	args = append(args, strings.Fields(extraArgs)...)
 
 	// 启动sglang服务
-	cmd := exec.Command("python", args...)
+	cmd = exec.Command("python", args...)
 	wLogger.Infow("Starting sglang server", "command", strings.Join(cmd.Args, " "))
 	fmt.Printf("Starting sglang server \n")
 	// 创建管道捕获输出
@@ -279,9 +265,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 // waitServerReady 等待服务器就绪
 func waitServerReady(serverURL string) error {
-	maxRetries := 3000 // 最多重试30次
-	for i := 0; i < maxRetries; i++ {
-		resp, err := http.Get(serverURL)
+	httpClient := http.Client{
+		Timeout: HTTP_SERVER_REQUEST_TIMEOUT,
+	}
+	maxRetries := 0
+	timeInerval := time.Second // 请求间隔
+	for i := 0; timeInerval < HTTP_SERVER_MAX_RETRY_TIME; i++ {
+		resp, err := httpClient.Get(serverURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			wLogger.Debugw("Server ready", "url", serverURL)
 			resp.Body.Close()
@@ -293,7 +283,9 @@ func waitServerReady(serverURL string) error {
 		}
 
 		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		time.Sleep(time.Second)
+		time.Sleep(timeInerval)
+		timeInerval *= 2 // 每次重试增加间隔
+		maxRetries++
 	}
 	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
 }
@@ -347,61 +339,31 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	return unsafe.Pointer(inst), nil
 }
 
-// PDInfo 结构体用于存储PD相关信息
-type PDInfo struct {
-	BootstrapIP   string `json:"bootstrap_ip"`
-	BootstrapPort int    `json:"bootstrap_port"`
-	BootstrapRoom int64  `json:"bootstrap_room"`
-	PrefillAddr   string `json:"prefill_addr"`
-}
-
-// getPDInfo 获取PD相关信息
-func getPDInfo() *PDInfo {
-	bootstrapIP := getLocalIP()
-	bootstrapPort := 8998 // 默认端口
-	if port := os.Getenv("PD_BOOTSTRAP_PORT"); port != "" {
-		if p, err := strconv.Atoi(port); err == nil {
-			bootstrapPort = p
-		}
-	}
-
-	roomID := requestManager.IDAllocator.Allocate()
-	prefillAddr := fmt.Sprintf("%s:%d", bootstrapIP, httpServerPort)
-
-	return &PDInfo{
-		BootstrapIP:   bootstrapIP,
-		BootstrapPort: bootstrapPort,
-		BootstrapRoom: roomID,
-		PrefillAddr:   prefillAddr,
-	}
-}
-
-func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string) (*comwrapper.WrapperData, error) {
+func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string) (comwrapper.WrapperData, error) {
 	result := map[string]interface{}{
-		"choice": []map[string]interface{}{
+		"choices": []map[string]interface{}{
 			{
 				"content":           text,
 				"reasoning_content": resoning_content,
-				"index":             index,
+				"index":             0,
 				"role":              "assistant",
 			},
 		},
 		"question_type": "",
 	}
 	data, err := json.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-	return &comwrapper.WrapperData{
+
+	return comwrapper.WrapperData{
 		Key:      "content",
 		Data:     data,
 		Desc:     nil,
 		Encoding: "utf-8",
 		Type:     comwrapper.DataText,
 		Status:   status,
-	}, nil
+	}, err
 }
-func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token int) (*comwrapper.WrapperData, error) {
+
+func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token int) (comwrapper.WrapperData, error) {
 	result := map[string]interface{}{
 		"usage": map[string]interface{}{
 			"prompt_tokens":     prompt_token,
@@ -411,28 +373,54 @@ func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token 
 		},
 	}
 	data, err := json.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-	return &comwrapper.WrapperData{
+
+	return comwrapper.WrapperData{
 		Key:      "usage",
 		Data:     data,
 		Desc:     nil,
 		Encoding: "utf-8",
 		Type:     comwrapper.DataText,
 		Status:   status,
-	}, nil
+	}, err
 }
+
+func responseError(inst *wrapperInst, err error) {
+	wLogger.Debugf("WrapperWrite stream err:%v, sid:%v\n", err.Error(), inst.sid)
+	if err := inst.callback(inst.usrTag, nil, err); err != nil {
+		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
+	}
+}
+
+func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_len int) error {
+	status := comwrapper.DataEnd
+	usageWrapperData, err := responseUsage(status, prompt_tokens_len, result_tokens_len)
+	if err != nil {
+		responseError(inst, err)
+		return err
+	}
+	content, err := responseContent(status, index, "", "")
+	if err != nil {
+		responseError(inst, err)
+		return err
+	}
+	responseData := []comwrapper.WrapperData{content, usageWrapperData}
+	wLogger.Debugf("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v, sid:%v\n", index, prompt_tokens_len, result_tokens_len, responseData, inst.sid)
+	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
+		wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+		return err
+	}
+	return nil
+}
+
 func toString(v any) string {
-	bytes, _ := json.Marshal(v)
-	return string(bytes)
+	res, _ := json.Marshal(v)
+	return string(res)
 }
 
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
 	inst := (*wrapperInst)(hdl)
-	wLogger.Debugw(fmt.Sprintf("WrapperWrite inst:%v\n", toString(inst)))
-	wLogger.Debugw(fmt.Sprintf("WrapperWrite req:%v\n", toString(req)))
+	wLogger.Debugf("WrapperWrite inst:%v, req:%v\n", toString(inst), toString(req))
 	if !inst.active {
 		wLogger.Warnw("WrapperWrite called on inactive instance", "sid", inst.sid)
 		return fmt.Errorf("instance is not active")
@@ -455,17 +443,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	default:
 	}
 
-	// patch_id := inst.params["patch_id"]
-	// if len(patch_id) == 0 {
-	// 	patch_id= "0"
-	// }
-
-	// model_name := pretrainedName
-	// var lora_path string
-	// if finetuneType == "lora" || finetuneType == "qlora"{
-	// 	if patch_id != "0" {
-	// }
-
 	for _, v := range req {
 		if v.Key == "__kv_info" {
 			continue // 跳过kv_info数据
@@ -473,22 +450,19 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		wLogger.Debugw("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
 
-		// 从params中获取参数
-		temperature := 0.95 // 默认值
+		// 从params中获取参数, 否则使用默认值
 		if temp, ok := inst.params["temperature"]; ok {
 			if t, err := strconv.ParseFloat(temp, 64); err == nil {
 				temperature = t
 			}
 		}
 
-		maxTokens := 2048 // 默认值
 		if tokens, ok := inst.params["max_tokens"]; ok {
 			if t, err := strconv.Atoi(tokens); err == nil {
 				maxTokens = t
 			}
 		}
 
-		topP := 0.95 // 默认值
 		if tp, ok := inst.params["top_p"]; ok {
 			if t, err := strconv.ParseFloat(tp, 32); err == nil {
 				topP = t
@@ -527,13 +501,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			},
 			TopP: float32(topP),
 		}
-		wLogger.Debugw(fmt.Sprintf("WrapperWrite streamReq:%v\n", toString(streamReq)), "sid", inst.sid)
+		wLogger.Debugf("WrapperWrite streamReq:%v, %v\n", toString(streamReq), inst.sid)
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite starting stream inference", "sid", inst.sid)
-			// startTime := time.Now()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+
+			ctx, cancel := context.WithTimeout(context.Background(), streamContextTimeoutSeconds)
 			defer cancel()
 
 			stream, err := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
@@ -555,8 +529,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				responseError(inst, err)
 				return
 			}
-			wLogger.Debugw(fmt.Sprintf("fisrtFrameContent:%v", toString(firstFrameContent)), "sid", inst.sid)
-			if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{*firstFrameContent}, nil); err != nil {
+			wLogger.Debugf("fisrtFrameContent:%v index:%v,status:%v sid:%v\n", "", index, status, inst.sid)
+			if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{firstFrameContent}, nil); err != nil {
 				wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 				return
 			}
@@ -567,12 +541,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				case <-ctx.Done():
 					if ctx.Err() == context.DeadlineExceeded {
 						wLogger.Warnw("WrapperWrite stream timeout", "sid", inst.sid)
+						responseError(inst, fmt.Errorf(STREAM_CONNECT_TIMEOUT))
 						goto endLoop
 					}
 					return
 				default:
 					// 创建响应数据切片
-					responseData := make([]comwrapper.WrapperData, 0, 3) // 预分配容量为2
+					responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
 
 					response, err := stream.Recv()
 
@@ -581,13 +556,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							wLogger.Infow("WrapperWrite stream ended normally", "sid", inst.sid)
 							goto endLoop
 						}
+						responseError(inst, err)
 						wLogger.Errorw("WrapperWrite read stream error", "error", err, "sid", inst.sid)
 						return
 					}
 
 					// 处理content数据
 					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
-						var content *comwrapper.WrapperData
+						var content comwrapper.WrapperData
 						chunk_content := response.Choices[0].Delta.Content
 						if chunk_content == R1_THINK_START {
 							thinking = true
@@ -597,23 +573,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							// content的内容是</think>，有可能出来2帧
 							thinking = false
 							chunks := strings.Split(chunk_content, R1_THINK_END)
-
-							if len(chunks) != 2 {
-								wLogger.Errorw("WrapperWrite chunks length is not 2", "chunks", chunks)
-								responseError(inst, err)
-								return
-							}
 							reasoning_last_chunk := chunks[0]
 							answer_start_chunk := chunks[1]
+
 							reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk)
-							wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response reasoning_last_chunk:%v\n", reasoning_last_chunk_content), "sid", inst.sid)
+							wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_last_chunk:%v, sid:%v\n", index, status, reasoning_last_chunk, inst.sid)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
 								return
 							}
 							fullContent += reasoning_last_chunk
-							responseData = []comwrapper.WrapperData{*reasoning_last_chunk_content}
+							responseData = append(responseData, reasoning_last_chunk_content)
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 								wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 								return
@@ -626,9 +597,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								responseError(inst, err)
 								return
 							}
-							wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response answer_start_chunk:%v\n", answer_start_chunk_content), "sid", inst.sid)
-							fullContent += answer_start_chunk
-							responseData = []comwrapper.WrapperData{*answer_start_chunk_content}
+							wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, answer_start_chunk:%v, sid:%v\n", index, status, answer_start_chunk, inst.sid)
+							responseData[0] = answer_start_chunk_content
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 								wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 								return
@@ -652,14 +622,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								return
 							}
 						}
-						responseData = append(responseData, *content)
+						responseData = append(responseData, content)
 						fullContent += chunk_content
-						index += 1
-						wLogger.Debugw(fmt.Sprintf("WrapperWrite stream response think:%v, index:%v, responseData:%v\n", thinking, index, toString(responseData)), "sid", inst.sid)
+						wLogger.Debugf("WrapperWrite stream response think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, chunk_content, inst.sid)
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 							return
 						}
+						index += 1
 					}
 
 					// 处理usage数据
@@ -667,7 +637,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						// 创建usage数据结构
 						promptTokensLen = response.Usage.PromptTokens
 						resultTokensLen = response.Usage.CompletionTokens
-						wLogger.Debugw(fmt.Sprintf("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v\n", index, promptTokensLen, resultTokensLen), "sid", inst.sid)
+						wLogger.Debugf("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v sid:%v\n", index, promptTokensLen, resultTokensLen, inst.sid)
 						err = responseEnd(inst, index, promptTokensLen, resultTokensLen)
 						if err != nil {
 							return
@@ -684,46 +654,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		}(streamReq, v.Status)
 	}
 
-	return nil
-}
-func responseError(inst *wrapperInst, err error) {
-	if inst == nil {
-		wLogger.Errorw("WrapperWrite instance is nil", "error", err)
-		return
-	}
-	wLogger.Errorw("WrapperWrite stream error", "error", err, "sid", inst.sid)
-	// 发送错误响应
-	errorContent := comwrapper.WrapperData{
-		Key:      "content",
-		Data:     []byte(fmt.Sprintf(`{"error": "%v"}`, err)),
-		Desc:     nil,
-		Encoding: "utf-8",
-		Type:     comwrapper.DataText,
-		Status:   comwrapper.DataEnd,
-	}
-	wLogger.Debugw(fmt.Sprintf("WrapperWrite stream errorContent:%v\n", toString(errorContent)), "sid", inst.sid)
-	if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{errorContent}, nil); err != nil {
-		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
-	}
-}
-func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_len int) error {
-	status := comwrapper.DataEnd
-	usageWrapperData, err := responseUsage(status, prompt_tokens_len, result_tokens_len)
-	if err != nil {
-		responseError(inst, err)
-		return err
-	}
-	content, err := responseContent(status, index, "", "")
-	if err != nil {
-		responseError(inst, err)
-		return err
-	}
-	responseData := []comwrapper.WrapperData{*content, *usageWrapperData}
-	wLogger.Debugw(fmt.Sprintf("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v\n", index, prompt_tokens_len, result_tokens_len, toString(responseData)), "sid", inst.sid)
-	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-		wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
-		return err
-	}
 	return nil
 }
 
@@ -743,6 +673,18 @@ func WrapperRead(hdl unsafe.Pointer) (respData []comwrapper.WrapperData, err err
 
 // WrapperFini 插件资源销毁
 func WrapperFini() (err error) {
+	fmt.Printf("WrapperFini called\n")
+	fmt.Printf("WrapperFini cmd:%+v\n", toString(cmd))
+	if cmd != nil && cmd.Process != nil {
+		if err = cmd.Process.Kill(); err != nil {
+			fmt.Printf("WrapperFini err:%v\n", err)
+			wLogger.Debugf("WrapperFini err:%v", err)
+		} else {
+			fmt.Printf("WrapperFini cmd kill success\n")
+			wLogger.Debugf("WrapperFini cmd kill success")
+		}
+	}
+	wLogger.Debugf("WarpperFini success")
 	return
 }
 
@@ -768,6 +710,25 @@ func WrapperDebugInfo(hdl interface{}) (debug string) {
 
 // WrapperSetCtrl 设置控制函数
 func WrapperSetCtrl(fType comwrapper.CustomFuncType, f interface{}) (err error) {
+	switch fType {
+	case comwrapper.FuncTraceLog:
+		traceFunc = f.(func(usrTag string, key string, value string) (code int))
+		fmt.Println("WrapperSetCtrl traceLogFunc set successful.")
+	case comwrapper.FuncMeter:
+		meterFunc = f.(func(usrTag string, key string, count int) (code int))
+		fmt.Println("WrapperSetCtrl meterFunc set successful.")
+	default:
+
+	}
+	return
+}
+
+func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
+	return nil, nil
+}
+
+// WrapperNotify 插件通知
+func WrapperNotify(res comwrapper.WrapperData) (err error) {
 	return nil
 }
 
@@ -809,7 +770,7 @@ func parseMessages(prompt string) []Message {
 // formatMessages 格式化消息，支持搜索模板
 func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
 	messages := parseMessages(prompt)
-	wLogger.Debugw(fmt.Sprintf("formatMessages messages: %v\n", messages))
+	wLogger.Debugf("formatMessages messages: %v\n", messages)
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
@@ -824,7 +785,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			break
 		}
 	}
-	wLogger.Debugw(fmt.Sprintf("formatMessages lastToolMsg: %v\n", lastToolMsg))
+	wLogger.Debugf("formatMessages lastToolMsg: %v\n", lastToolMsg)
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
@@ -859,7 +820,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			content["index"])
 		formattedContent = append(formattedContent, formattedText)
 	}
-	wLogger.Debugw(fmt.Sprintf("formatMessages formattedContent: %v\n", formattedContent))
+	wLogger.Debugf("formatMessages formattedContent: %v\n", formattedContent)
 
 	// 获取当前日期
 	now := time.Now()
@@ -886,9 +847,9 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 
 			// 准备模板数据
 			data := struct {
-				SearchResults string
-				CurDate       string
-				Question      string
+				SearchResults string `json:"search_results"`
+				CurDate       string `json:"cur_date"`
+				Question      string `json:"question"`
 			}{
 				SearchResults: strings.Join(formattedContent, "\n"),
 				CurDate:       currentDate,
@@ -908,71 +869,6 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 	}
 
 	return messages
-}
-
-func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
-	return nil, nil
-}
-
-// CircularIDAllocator ID分配器
-type CircularIDAllocator struct {
-	MinID     int64
-	MaxID     int64
-	CurrentID int64
-	IP        string
-	Port      int
-	IPHash    int64
-	Offset    int64
-	Lock      sync.Mutex
-}
-
-// NewCircularIDAllocator 创建ID分配器
-func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
-	ip := mockIP
-	if ip == "" {
-		ip = getLocalIP()
-	}
-
-	ipHash := hashIP(ip)
-	offset := (ipHash * (1 << 32)) + (int64(port) * (1 << 16))
-
-	return &CircularIDAllocator{
-		MinID:     0,
-		MaxID:     math.MaxInt64,
-		CurrentID: 0,
-		IP:        ip,
-		Port:      port,
-		IPHash:    ipHash,
-		Offset:    offset,
-	}
-}
-
-// Allocate 分配新ID
-func (a *CircularIDAllocator) Allocate() int64 {
-	a.Lock.Lock()
-	defer a.Lock.Unlock()
-
-	allocatedID := a.CurrentID + a.Offset
-	a.CurrentID++
-
-	if a.CurrentID >= (1 << 32) {
-		a.CurrentID = 0
-	}
-
-	return allocatedID
-}
-
-// hashIP IP地址哈希
-func hashIP(ip string) int64 {
-	parts := strings.Split(ip, ".")
-	hash := int64(0)
-
-	for _, part := range parts {
-		num, _ := strconv.ParseInt(part, 10, 64)
-		hash = (hash*256 + num) % (1 << 32)
-	}
-
-	return hash
 }
 
 // OpenAIClient OpenAI客户端
@@ -1008,11 +904,6 @@ type ChatCompletionRequest struct {
 	Stream      bool      `json:"stream,omitempty"`
 	Tools       []Tool    `json:"tools,omitempty"`
 	ToolChoice  string    `json:"tool_choice,omitempty"`
-	// PD相关参数
-	BootstrapHost string `json:"bootstrap_host,omitempty"`
-	BootstrapPort int    `json:"bootstrap_port,omitempty"`
-	BootstrapRoom int64  `json:"bootstrap_room,omitempty"`
-	PrefillAddr   string `json:"prefill_addr,omitempty"`
 }
 
 // Message 消息结构
@@ -1062,9 +953,11 @@ func monitorSubprocess(cmd *exec.Cmd) {
 	// 等待进程结束
 	err := cmd.Wait()
 	if err != nil {
+		fmt.Printf("Sglang process exited with error:%v\n", err)
 		wLogger.Errorw("Sglang process exited with error", "error", err)
 		// 这里可以添加重启逻辑或其他错误处理
 	} else {
+		fmt.Printf("Sglang process exited normally\n")
 		wLogger.Debugw("Sglang process exited normally")
 	}
 }
@@ -1091,8 +984,4 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 		}
 	}
 	return openAIMessages
-}
-
-func WrapperNotify(res comwrapper.WrapperData) (err error) {
-	return nil
 }
