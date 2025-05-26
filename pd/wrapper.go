@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"git.iflytek.com/AIaaS/xsf/utils"
+	"github.com/whybeyoung/go-openai"
 )
 
 var (
@@ -501,9 +502,36 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"maxTokens", maxTokens)
 
 		// 创建流式请求
+		messages := convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex))
+
+		foundThinkingEndFlag := false
+		foundThinkingBeginFlag := false
+		// 添加thinking逻辑， 这里是针对r1 think 的逻辑
+		thinking := false
+		if os.Getenv("IS_REASONING_MODEL") == "true" {
+			if len(messages) > 0 {
+				lastMsg := messages[len(messages)-1]
+				if lastMsg.Role != "assistant" {
+					messages = append(messages, openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "<think>\n",
+					})
+					thinking = true
+				}
+			}
+		}
+
+		wLogger.Infow("Wrapper Send Engine messages", "messages", messages)
+
+		// 获取enable_thinking参数 这里是针对 qwenv3 的逻辑
+		enableThinking := false
+		if enableThinkingStr, ok := inst.params["enable_thinking"]; ok {
+			enableThinking = strings.ToLower(enableThinkingStr) == "true"
+		}
+
 		streamReq := &openai.ChatCompletionRequest{
 			Model:       "default",
-			Messages:    convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)),
+			Messages:    messages,
 			Temperature: float32(temperature),
 			MaxTokens:   maxTokens,
 			Stream:      true,
@@ -516,10 +544,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				"bootstrap_port": pdInfo.BootstrapPort,
 				"bootstrap_room": pdInfo.BootstrapRoom,
 				"prefill_addr":   pdInfo.PrefillAddr,
+				"rid":            inst.sid,
 				"session_params": map[string]interface{}{
 					"rid": inst.sid,
 				},
 			},
+		}
+		if enableThinking {
+			streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
+				"enable_thinking": enableThinking,
+			}
 		}
 
 		// 使用协程处理流式请求
@@ -551,6 +585,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			index := 0
 			done := make(chan struct{})
 			last := false
+			var result map[string]interface{}
 
 			for {
 				select {
@@ -621,18 +656,53 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					// 处理content数据
 					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
 						index += 1
-						// 构建与Python代码一致的响应格式
-						result := map[string]interface{}{
-							"choices": []map[string]interface{}{
-								{
-									"content": response.Choices[0].Delta.Content,
-									"index":   index,
-									"role":    "assistant",
-								},
-							},
-							"question_type": "",
+						chunkContent := response.Choices[0].Delta.Content
+
+						// log first chunk
+						if index == 1 {
+							wLogger.Infow("WrapperWrite first chunk", "chunk", chunkContent, "sid", inst.sid)
 						}
 
+						// 处理thinking结束的情况
+						if strings.EqualFold(chunkContent, "</think>") && !foundThinkingEndFlag {
+							foundThinkingEndFlag = true // 设置标志位 避免内容中包含多个</think>
+							thinking = false
+							continue
+						}
+
+						// 处理thinking开始的情况
+						if strings.EqualFold(chunkContent, "<think>") && !foundThinkingBeginFlag && thinking {
+							foundThinkingBeginFlag = true // 设置标志位 避免内容中包含多个<think>
+							continue
+						}
+
+						// 构建与Python代码一致的响应格式
+
+						if thinking {
+							result = map[string]interface{}{
+								"choices": []map[string]interface{}{
+									{
+										"reasoning_content": chunkContent,
+										"content":           "",
+										"index":             index,
+										"role":              "assistant",
+									},
+								},
+								"question_type": "",
+							}
+						} else {
+							result = map[string]interface{}{
+								"choices": []map[string]interface{}{
+									{
+										"content":           chunkContent,
+										"reasoning_content": "",
+										"index":             index,
+										"role":              "assistant",
+									},
+								},
+								"question_type": "",
+							}
+						}
 						data, err := json.Marshal(result)
 						if err != nil {
 							wLogger.Errorw("WrapperWrite marshal error", "error", err, "sid", inst.sid)
@@ -650,7 +720,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							Status:   status,
 						}
 						responseData = append(responseData, content)
-
 					}
 
 					// 在decode模式下发送usage数据
@@ -912,6 +981,7 @@ type CircularIDAllocator struct {
 	Port      int
 	IPHash    int64
 	Offset    int64
+	TimeBase  int64 // 添加时间基准
 	Lock      sync.Mutex
 }
 
@@ -923,7 +993,11 @@ func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
 	}
 
 	ipHash := hashIP(ip)
-	offset := (ipHash * (1 << 32)) + (int64(port) * (1 << 16))
+	// 使用纳秒级时间戳作为时间因子
+	timeBase := time.Now().UnixNano()
+	// 将时间戳右移20位，保留高位，避免ID增长过快
+	timeBase = timeBase >> 20
+	offset := (ipHash * (1 << 32)) + (int64(port) * (1 << 16)) + timeBase
 
 	return &CircularIDAllocator{
 		MinID:     0,
@@ -933,6 +1007,7 @@ func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
 		Port:      port,
 		IPHash:    ipHash,
 		Offset:    offset,
+		TimeBase:  timeBase,
 	}
 }
 
@@ -940,6 +1015,14 @@ func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
 func (a *CircularIDAllocator) Allocate() int64 {
 	a.Lock.Lock()
 	defer a.Lock.Unlock()
+
+	// 获取当前时间戳并右移20位
+	currentTime := time.Now().UnixNano() >> 20
+	// 如果时间基准发生变化，更新Offset
+	if currentTime != a.TimeBase {
+		a.TimeBase = currentTime
+		a.Offset = (a.IPHash * (1 << 32)) + (int64(a.Port) * (1 << 16)) + currentTime
+	}
 
 	allocatedID := a.CurrentID + a.Offset
 	a.CurrentID++
@@ -1051,10 +1134,34 @@ func monitorSubprocess(cmd *exec.Cmd) {
 	// 等待进程结束
 	err := cmd.Wait()
 	if err != nil {
-		wLogger.Errorw("Sglang process exited with error", "error", err)
-		// 这里可以添加重启逻辑或其他错误处理
+		// 获取退出码
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode := exitErr.ExitCode()
+			wLogger.Errorw("Sglang process exited with error",
+				"error", err,
+				"exit_code", exitCode)
+			// 根据退出码进行相应处理
+			switch exitCode {
+			case 0:
+				wLogger.Infow("Sglang process exited normally")
+			case 1:
+				wLogger.Errorw("Sglang process failed with general error")
+			case 2:
+				wLogger.Errorw("Sglang process failed with configuration error")
+			default:
+				wLogger.Errorw("Sglang process failed with unknown error code")
+			}
+		} else {
+			wLogger.Errorw("Sglang process failed to start or was terminated", "error", err)
+		}
+		// 子进程退出，主进程也退出
+		wLogger.Errorw("Sglang process exited, exiting main process")
+		os.Exit(1)
 	} else {
 		wLogger.Debugw("Sglang process exited normally")
+		// 子进程正常退出，主进程也退出
+		wLogger.Infow("Sglang process exited normally, exiting main process")
+		os.Exit(0)
 	}
 }
 
