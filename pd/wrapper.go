@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"net/http"
@@ -21,18 +20,24 @@ import (
 	"unsafe"
 
 	"git.iflytek.com/AIaaS/xsf/utils"
+	zmq "github.com/pebbe/zmq4"
+	"github.com/vmihailenco/msgpack/v5"
 	"github.com/whybeyoung/go-openai"
 )
 
 var (
-	wLogger                     *utils.Logger
+	wLogger *utils.Logger
+	zLogger *utils.Logger
+
 	logLevel                    = "debug"
 	logCount                    = 10
-	logSize                     = 30
+	logSize                     = 100
 	logAsync                    = true
 	logPath                     = "/log/app/wrapper.log"
+	zmqLogPath                  = "/log/app/zmqReceiver.log"
 	respKey                     = "content"
 	requestManager              *RequestManager
+	tokenizerManager            *TokenizerManager
 	httpServerPort              int
 	isDecodeMode                bool   // 添加全局变量存储PD模式
 	promptSearchTemplate        string // 添加全局变量存储搜索模板
@@ -65,6 +70,258 @@ func NewRequestManager(client *OpenAIClient) *RequestManager {
 		Logger:      logger,
 		IDAllocator: NewCircularIDAllocator("", 0),
 	}
+}
+
+// todo move to single file
+type BatchStrOut struct {
+	Rids                      []string                 `msgpack:"rids"`
+	FinishedReasons           []map[string]interface{} `msgpack:"finished_reasons"`
+	OutputStrs                []string                 `msgpack:"output_strs"`
+	OutputIds                 []int                    `msgpack:"output_ids"`
+	PromptTokens              []int                    `msgpack:"prompt_tokens"`
+	CompletionTokens          []int                    `msgpack:"completion_tokens"`
+	CachedTokens              []int                    `msgpack:"cached_tokens"`
+	SpecVerifyCt              []int                    `msgpack:"spec_verify_ct"`
+	InputTokenLogprobsVal     []float64                `msgpack:"input_token_logprobs_val"`
+	InputTokenLogprobsIdx     []int                    `msgpack:"input_token_logprobs_idx"`
+	OutputTokenLogprobsVal    []float64                `msgpack:"output_token_logprobs_val"`
+	OutputTokenLogprobsIdx    []int                    `msgpack:"output_token_logprobs_idx"`
+	InputTopLogprobsVal       [][]interface{}          `msgpack:"input_top_logprobs_val"`
+	InputTopLogprobsIdx       [][]interface{}          `msgpack:"input_top_logprobs_idx"`
+	OutputTopLogprobsVal      [][]interface{}          `msgpack:"output_top_logprobs_val"`
+	OutputTopLogprobsIdx      [][]interface{}          `msgpack:"output_top_logprobs_idx"`
+	InputTokenIdsLogprobsVal  [][]interface{}          `msgpack:"input_token_ids_logprobs_val"`
+	InputTokenIdsLogprobsIdx  [][]interface{}          `msgpack:"input_token_ids_logprobs_idx"`
+	OutputTokenIdsLogprobsVal [][]interface{}          `msgpack:"output_token_ids_logprobs_val"`
+	OutputTokenIdsLogprobsIdx [][]interface{}          `msgpack:"output_token_ids_logprobs_idx"`
+	OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
+}
+
+// TokenizerManager 管理分词器和ZMQ通信
+type TokenizerManager struct {
+	zmqContext *zmq.Context
+	zmqSocket  *zmq.Socket
+	zmqPort    string
+	leaderAddr string
+	logger     *utils.Logger
+	mu         sync.RWMutex
+	RIDToState map[string]*ReqState
+	// 添加 rid 操作通道映射
+	ridOpChans map[string]chan func()
+	chanMu     sync.RWMutex
+}
+
+// ReqState 存储每个请求的状态
+type ReqState struct {
+	OutList      []map[string]interface{}
+	OutStrList   [][]byte // 存储每次的文本增量
+	Finished     bool
+	Event        chan struct{}
+	Obj          interface{}
+	CreatedTime  time.Time
+	FinishedTime time.Time
+	Text         string
+}
+
+// NewTokenizerManager 创建新的TokenizerManager实例
+func NewTokenizerManager(leaderAddr, zmqPort string) (*TokenizerManager, error) {
+	context, err := zmq.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zmq context: %v", err)
+	}
+
+	return &TokenizerManager{
+		zmqContext: context,
+		zmqPort:    zmqPort,
+		leaderAddr: leaderAddr,
+		logger:     zLogger,
+		RIDToState: make(map[string]*ReqState),
+		ridOpChans: make(map[string]chan func()),
+	}, nil
+}
+
+// getOrCreateRIDOpChan 获取或创建 rid 的操作通道
+func (tm *TokenizerManager) getOrCreateRIDOpChan(rid string) chan func() {
+	tm.chanMu.Lock()
+	defer tm.chanMu.Unlock()
+
+	ch, exists := tm.ridOpChans[rid]
+	if !exists {
+		// 创建带缓冲的通道，缓冲区大小为100
+		ch = make(chan func(), 4096)
+		tm.ridOpChans[rid] = ch
+		// 启动操作处理协程
+		go tm.processRIDOps(rid, ch)
+	}
+	return ch
+}
+
+// processRIDOps 处理特定 rid 的操作
+func (tm *TokenizerManager) processRIDOps(rid string, ch chan func()) {
+	for {
+		select {
+		case op, ok := <-ch:
+			if !ok {
+				// channel 已关闭，退出处理
+				tm.logger.Infow("Operation channel closed, exiting processRIDOps", "rid", rid)
+				return
+			}
+			// 执行操作
+			op()
+		}
+	}
+}
+
+// HandleBatchOutput processes batch outputs from the tokenizer
+func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
+	var batchOut BatchStrOut
+	if err := msgpack.Unmarshal(data, &batchOut); err != nil {
+		return err
+	}
+	tm.logger.Infow("Handle batch output", "rids", strings.Join(batchOut.Rids, "|"))
+	// 并发处理每个 rid，不需要等待完成
+	for i, rid := range batchOut.Rids {
+		go func(idx int, requestID string) {
+			// 获取 rid 的操作通道
+			opChan := tm.getOrCreateRIDOpChan(requestID)
+
+			// 使用 select 和 ok 模式检查通道状态
+			select {
+			case opChan <- func() {
+				tm.mu.RLock()
+				state, exists := tm.RIDToState[requestID]
+				tm.mu.RUnlock()
+
+				if !exists {
+					tm.logger.Warnw("Received output for rid but state was deleted", "rid", requestID)
+					return
+				}
+
+				// Build meta_info
+				metaInfo := map[string]interface{}{
+					"id":            requestID,
+					"finish_reason": batchOut.FinishedReasons[idx],
+					"prompt_tokens": batchOut.PromptTokens[idx],
+				}
+
+				// Add completion and cached tokens
+				metaInfo["completion_tokens"] = batchOut.CompletionTokens[idx]
+				metaInfo["cached_tokens"] = batchOut.CachedTokens[idx]
+
+				// Process output
+				state.Text += batchOut.OutputStrs[idx]
+
+				// 构建增量响应结构
+				chunkResponse := map[string]interface{}{
+					"choices": []map[string]interface{}{
+						{
+							"content":           batchOut.OutputStrs[idx],
+							"reasoning_content": "",
+							"index":             idx,
+							"role":              "assistant",
+						},
+					},
+					"question_type": "",
+				}
+
+				// 序列化增量响应
+				chunkJSON, err := json.Marshal(chunkResponse)
+				if err != nil {
+					tm.logger.Errorw("Failed to marshal chunk response", "error", err, "rid", requestID)
+					return
+				}
+
+				state.OutStrList = append(state.OutStrList, chunkJSON)
+
+				outDict := map[string]interface{}{
+					"meta_info": metaInfo,
+				}
+
+				// Update state
+				state.Finished = batchOut.FinishedReasons[idx] != nil
+				if state.Finished {
+					state.FinishedTime = time.Now()
+					metaInfo["e2e_latency"] = state.FinishedTime.Sub(state.CreatedTime).Seconds()
+
+					// 使用 DeleteRequestState 来确保状态和通道都被正确清理
+					tm.DeleteRequestState(requestID)
+				}
+
+				state.OutList = append(state.OutList, outDict)
+				select {
+				case state.Event <- struct{}{}:
+				default:
+					tm.logger.Warnw("Event channel is full or closed", "rid", requestID)
+				}
+			}:
+				// 成功放入操作通道
+			default:
+				tm.logger.Warnw("Operation channel is full or closed for rid", "rid", requestID)
+			}
+		}(i, rid)
+	}
+
+	return nil
+}
+
+// receiveLoop 接收消息的循环
+func (tm *TokenizerManager) receiveLoop() {
+	for {
+		msg, err := tm.zmqSocket.RecvBytes(0)
+		if err != nil {
+			tm.logger.Errorw("Receive error:", "error", err)
+			continue
+		}
+
+		// 使用协程处理消息，避免阻塞接收循环
+		go func(message []byte) {
+			if err := tm.HandleBatchOutput(message); err != nil {
+				tm.logger.Errorw("Handle batch output error:", "error", err)
+			}
+		}(msg)
+	}
+}
+
+// Start 启动ZMQ接收器
+func (tm *TokenizerManager) Start() error {
+	socket, err := tm.zmqContext.NewSocket(zmq.PULL)
+	if err != nil {
+		return fmt.Errorf("failed to create zmq socket: %v", err)
+	}
+	tm.zmqSocket = socket
+
+	err = socket.Bind(fmt.Sprintf("tcp://*:%s", tm.zmqPort))
+	if err != nil {
+		return fmt.Errorf("failed to bind zmq socket: %v", err)
+	}
+
+	tm.logger.Infow("ZMQReceiver loop started...")
+	go tm.receiveLoop()
+	return nil
+}
+
+// Stop 停止ZMQ接收器
+func (tm *TokenizerManager) Stop() {
+	if tm.zmqSocket != nil {
+		tm.zmqSocket.Close()
+	}
+	if tm.zmqContext != nil {
+		tm.zmqContext.Term()
+	}
+}
+
+// AddRequest 添加新的请求
+func (tm *TokenizerManager) AddRequest(rid string) *ReqState {
+	state := &ReqState{
+		CreatedTime: time.Now(),
+		Event:       make(chan struct{}, 1),
+	}
+
+	tm.mu.Lock()
+	tm.RIDToState[rid] = state
+	tm.mu.Unlock()
+
+	return state
 }
 
 // WrapperInit 插件初始化, 全局只调用一次. 本地调试时, cfg参数由aiges.toml提供
@@ -118,6 +375,17 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if err != nil {
 		return fmt.Errorf("loggerErr:%v", err)
 	}
+	zLogger, err = utils.NewLocalLog(
+		utils.SetAsync(logAsync),
+		utils.SetLevel(logLevel),
+		utils.SetFileName(zmqLogPath),
+		utils.SetMaxSize(logSize),
+		utils.SetMaxBackups(logCount),
+	)
+	if err != nil {
+		zLogger.Errorw("Failed to create zmq logger", "error", err)
+		return
+	}
 
 	if promptSearchTemplate != "" {
 		wLogger.Infow("Using custom prompt search template")
@@ -133,6 +401,27 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if port == "" {
 		port = "40000"
 	}
+
+	// 获取端口配置
+	zmqPort := os.Getenv("ZMQ_SERVER_PORT")
+	if zmqPort == "" {
+		zmqPort = "10110"
+	}
+
+	leaderAddr := os.Getenv("LWS_LEADER_ADDRESS")
+	if leaderAddr != "" {
+		fmt.Printf("Start ZMQReceiver on %s:%s\n", leaderAddr, zmqPort)
+		var err error
+		tokenizerManager, err = NewTokenizerManager(leaderAddr, zmqPort)
+		if err != nil {
+			return fmt.Errorf("failed to create tokenizer manager: %v", err)
+		}
+
+		if err := tokenizerManager.Start(); err != nil {
+			return fmt.Errorf("failed to start tokenizer manager: %v", err)
+		}
+	}
+
 	httpServerPort, _ = strconv.Atoi(port)
 
 	// 获取额外参数
@@ -174,7 +463,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		}
 
 		// 获取leader地址
-		if leaderAddr := os.Getenv("LWS_LEADER_ADDRESS"); leaderAddr != "" {
+		if leaderAddr != "" {
 
 			distPort := os.Getenv("DIST_PORT")
 			if distPort == "" {
@@ -250,7 +539,8 @@ func WrapperInit(cfg map[string]string) (err error) {
 	requestManager = NewRequestManager(client)
 
 	wLogger.Debugw("WrapperInit successful")
-	return
+
+	return nil
 }
 
 // WrapperCreate 插件会话实例创建
@@ -264,14 +554,19 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 
 	// 创建新的实例
 	inst := &wrapperInst{
-		usrTag:     usrTag,
-		sid:        sid,
-		client:     requestManager.Client,
-		stopQ:      make(chan bool, 2),
-		firstFrame: true,
-		callback:   cb,
-		params:     params,
-		active:     true, // 初始化active为true
+		usrTag:           usrTag,
+		sid:              sid,
+		client:           requestManager.Client,
+		stopQ:            make(chan bool, 2),
+		firstFrame:       true,
+		callback:         cb,
+		params:           params,
+		active:           true,
+		tokenizerManager: tokenizerManager,
+	}
+	if inst.tokenizerManager != nil {
+		inst.tokenizerManager.AddRequest(inst.sid)
+		wLogger.Infow("WrapperCreate added request state for decode mode", "sid", inst.sid)
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -342,14 +637,32 @@ func getLocalIP() string {
 
 // wrapperInst 结构体定义
 type wrapperInst struct {
-	usrTag     string
-	sid        string
-	client     *OpenAIClient
-	stopQ      chan bool
-	firstFrame bool
-	callback   comwrapper.CallBackPtr
-	params     map[string]string
-	active     bool
+	usrTag           string
+	sid              string
+	client           *OpenAIClient
+	stopQ            chan bool
+	firstFrame       bool
+	callback         comwrapper.CallBackPtr
+	params           map[string]string
+	active           bool
+	tokenizerManager *TokenizerManager
+	stream           *openai.ChatCompletionStream
+}
+
+// SafeCloseStream 安全地关闭 stream
+func (inst *wrapperInst) SafeCloseStream() {
+	if inst.stream == nil {
+		return
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				wLogger.Warnw("Stream already closed", "error", r, "sid", inst.sid)
+			}
+		}()
+		inst.stream.Close()
+	}()
+	inst.stream = nil
 }
 
 // WrapperWrite 数据写入
@@ -472,6 +785,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				break
 			}
 		}
+
 	}
 
 	for _, v := range req {
@@ -504,22 +818,19 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 创建流式请求
 		messages := convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex))
 
-		foundThinkingEndFlag := false
-		foundThinkingBeginFlag := false
-		// 添加thinking逻辑， 这里是针对r1 think 的逻辑
-		thinking := false
-		if os.Getenv("IS_REASONING_MODEL") == "true" {
-			if len(messages) > 0 {
-				lastMsg := messages[len(messages)-1]
-				if lastMsg.Role != "assistant" {
-					messages = append(messages, openai.ChatCompletionMessage{
-						Role:    "assistant",
-						Content: "<think>\n",
-					})
-					thinking = true
-				}
-			}
-		}
+		// thinking := false
+		// if os.Getenv("IS_REASONING_MODEL") == "true" {
+		// 	if len(messages) > 0 {
+		// 		lastMsg := messages[len(messages)-1]
+		// 		if lastMsg.Role != "assistant" {
+		// 			messages = append(messages, openai.ChatCompletionMessage{
+		// 				Role:    "assistant",
+		// 				Content: "<think>\n",
+		// 			})
+		// 			thinking = true
+		// 		}
+		// 	}
+		// }
 
 		wLogger.Infow("Wrapper Send Engine messages", "messages", messages)
 
@@ -563,6 +874,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
+			index := 0
+
 			stream, err := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
 			if err != nil {
 				wLogger.Errorw("WrapperWrite stream error", "error", err, "sid", inst.sid)
@@ -582,10 +895,15 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 			defer stream.Close()
 
-			index := 0
+			// 获取请求状态
+			state, exists := inst.tokenizerManager.GetRequestState(inst.sid)
+			if !exists {
+				wLogger.Warnw("State not found for sid", "sid", inst.sid)
+				return
+			}
+
 			done := make(chan struct{})
-			last := false
-			var result map[string]interface{}
+			var totalPromptTokens, totalCompletionTokens int
 
 			for {
 				select {
@@ -596,169 +914,105 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 					close(done)
 					return
-				default:
-					if index == 0 {
-						status = comwrapper.DataBegin
-					} else {
-						status = comwrapper.DataContinue
-					}
-					// 创建响应数据切片
-					responseData := make([]comwrapper.WrapperData, 0, 3) // 预分配容量为2
+				case <-state.Event:
+					// 使用 goroutine 调用 Recv，并处理异常
+					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+								wLogger.Warnw("Stream Recv  Closed", "error", r, "sid", inst.sid)
+							}
+						}()
+						stream.Recv() // 不使用 http的响应 ，使用来自 zmq go callback
+					}()
+					// 获取最新的响应
+					if len(state.OutList) > 0 {
+						if index == 0 {
+							wLogger.Infow("Get First chunk ", "sid", inst.sid)
+						}
+						index++
+						lastOut := state.OutList[len(state.OutList)-1]
+						lastOutStr := state.OutStrList[len(state.OutStrList)-1]
+						// 从 meta_info 中获取 token 信息
+						if metaInfo, ok := lastOut["meta_info"].(map[string]interface{}); ok {
+							if promptTokens, ok := metaInfo["prompt_tokens"].(int); ok {
+								totalPromptTokens = promptTokens
+							}
+							if completionTokens, ok := metaInfo["completion_tokens"].(int); ok {
+								totalCompletionTokens = completionTokens
+							}
+						}
 
-					response, err := stream.Recv()
-					if err != nil {
-						if err == io.EOF {
-							wLogger.Infow("WrapperWrite stream ended normally", "sid", inst.sid)
+						// 创建响应数据切片
+						responseData := make([]comwrapper.WrapperData, 0, 2)
+
+						// 添加 content 响应
+						contentData := comwrapper.WrapperData{
+							Key:      "content",
+							Data:     lastOutStr, // lastOutStr 已经是 []byte 类型
+							Desc:     nil,
+							Encoding: "utf-8",
+							Type:     comwrapper.DataText,
+							Status:   comwrapper.DataContinue,
+						}
+
+						if state.Finished {
+							contentData.Status = comwrapper.DataEnd
+						}
+
+						responseData = append(responseData, contentData)
+
+						// 如果请求已完成，添加 usage 信息
+						if state.Finished {
+							usageData := struct {
+								PromptTokens     int `json:"prompt_tokens"`
+								CompletionTokens int `json:"completion_tokens"`
+								TotalTokens      int `json:"total_tokens"`
+								QuestionTokens   int `json:"question_tokens"`
+							}{
+								PromptTokens:     totalPromptTokens,
+								CompletionTokens: totalCompletionTokens,
+								TotalTokens:      totalPromptTokens + totalCompletionTokens,
+								QuestionTokens:   0,
+							}
+
+							usageJSON, err := json.Marshal(usageData)
+							if err != nil {
+								wLogger.Errorw("WrapperWrite marshal usage error", "error", err, "sid", inst.sid)
+							} else {
+								usageWrapperData := comwrapper.WrapperData{
+									Key:      "usage",
+									Data:     usageJSON,
+									Desc:     nil,
+									Encoding: "utf-8",
+									Type:     comwrapper.DataText,
+									Status:   comwrapper.DataEnd,
+								}
+								responseData = append(responseData, usageWrapperData)
+							}
+						}
+
+						if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
+							wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+						}
+
+						// 如果请求已完成，退出循环
+						if state.Finished {
+							// 检查并关闭 stream
+							inst.SafeCloseStream()
 							goto endLoop
 						}
-						wLogger.Errorw("WrapperWrite read stream error", "error", err, "sid", inst.sid)
-						close(done)
-						return
 					}
-
-					// 处理usage数据
-					if response.Usage != nil {
-						last = true
-						status = comwrapper.DataEnd
-						// 创建usage数据结构
-						usageData := struct {
-							PromptTokens     int `json:"prompt_tokens"`
-							CompletionTokens int `json:"completion_tokens"`
-							TotalTokens      int `json:"total_tokens"`
-							QuestionTokens   int `json:"question_tokens"`
-						}{
-							PromptTokens:     response.Usage.PromptTokens,
-							CompletionTokens: response.Usage.CompletionTokens,
-							TotalTokens:      response.Usage.PromptTokens + response.Usage.CompletionTokens,
-							QuestionTokens:   0,
-						}
-
-						// 序列化usage数据
-						usageJSON, err := json.Marshal(usageData)
-						if err != nil {
-							wLogger.Errorw("WrapperWrite marshal usage error", "error", err, "sid", inst.sid)
-							close(done)
-							return
-						}
-						wLogger.Infow("WrapperWrite usage data", "usage", string(usageJSON), "sid", inst.sid)
-
-						usageWrapperData := comwrapper.WrapperData{
-							Key:      "usage",
-							Data:     usageJSON,
-							Desc:     nil,
-							Encoding: "utf-8",
-							Type:     comwrapper.DataText,
-							Status:   status,
-						}
-						responseData = append(responseData, usageWrapperData)
-
-					}
-					// 处理content数据
-					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
-						index += 1
-						chunkContent := response.Choices[0].Delta.Content
-
-						// log first chunk
-						if index == 1 {
-							wLogger.Infow("WrapperWrite first chunk", "chunk", chunkContent, "sid", inst.sid)
-						}
-
-						// 处理thinking结束的情况
-						if strings.EqualFold(chunkContent, "</think>") && !foundThinkingEndFlag {
-							foundThinkingEndFlag = true // 设置标志位 避免内容中包含多个</think>
-							thinking = false
-							continue
-						}
-
-						// 处理thinking开始的情况
-						if strings.EqualFold(chunkContent, "<think>") && !foundThinkingBeginFlag && thinking {
-							foundThinkingBeginFlag = true // 设置标志位 避免内容中包含多个<think>
-							continue
-						}
-
-						// 构建与Python代码一致的响应格式
-
-						if thinking {
-							result = map[string]interface{}{
-								"choices": []map[string]interface{}{
-									{
-										"reasoning_content": chunkContent,
-										"content":           "",
-										"index":             index,
-										"role":              "assistant",
-									},
-								},
-								"question_type": "",
-							}
-						} else {
-							result = map[string]interface{}{
-								"choices": []map[string]interface{}{
-									{
-										"content":           chunkContent,
-										"reasoning_content": "",
-										"index":             index,
-										"role":              "assistant",
-									},
-								},
-								"question_type": "",
-							}
-						}
-						data, err := json.Marshal(result)
-						if err != nil {
-							wLogger.Errorw("WrapperWrite marshal error", "error", err, "sid", inst.sid)
-							close(done)
-							return
-						}
-
-						// 添加content数据
-						content := comwrapper.WrapperData{
-							Key:      "content",
-							Data:     data,
-							Desc:     nil,
-							Encoding: "utf-8",
-							Type:     comwrapper.DataText,
-							Status:   status,
-						}
-						responseData = append(responseData, content)
-					}
-
-					// 在decode模式下发送usage数据
-					if isDecodeMode && len(responseData) > 0 {
-						// ru
-						if last && len(responseData) == 1 {
-							// 构建与Python代码一致的响应格式
-							index += 1
-							lastRst := map[string]interface{}{
-								"choices": []map[string]interface{}{
-									{
-										"content": "",
-										"index":   index,
-										"role":    "assistant",
-									},
-								},
-								"question_type": "",
-							}
-							data, _ := json.Marshal(lastRst)
-
-							responseData = append(responseData, comwrapper.WrapperData{
-								Key:      "content",
-								Data:     data,
-								Desc:     nil,
-								Encoding: "utf-8",
-								Type:     comwrapper.DataText,
-								Status:   comwrapper.DataEnd,
-							})
-						}
-						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
-							close(done)
-							return
-						}
-					}
+				case <-inst.stopQ:
+					// 检查并关闭 stream
+					inst.SafeCloseStream()
+					goto endLoop
 				}
 			}
 
 		endLoop:
+			// 确保 stream 被关闭
+			inst.SafeCloseStream()
+
 			if inst.active {
 				if !isDecodeMode {
 					keepAliveData := comwrapper.WrapperData{
@@ -776,13 +1030,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						wLogger.Infow("WrapperWrite sent keepalive_down end", "sid", inst.sid)
 					}
 				}
-
 			}
 
 			wLogger.Infow("WrapperWrite sending end signal", "sid", inst.sid)
 			close(done)
 			inst.stopQ <- true
-
 		}(streamReq, v.Status)
 	}
 
@@ -795,6 +1047,12 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
 	inst.active = false
 	inst.stopQ <- true
+
+	// 删除对应的状态
+	if inst.tokenizerManager != nil {
+		inst.tokenizerManager.DeleteRequestState(inst.sid)
+		wLogger.Infow("WrapperDestroy deleted state", "sid", inst.sid)
+	}
 
 	return nil
 }
@@ -1187,4 +1445,28 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 		}
 	}
 	return openAIMessages
+}
+
+// GetRequestState 安全地获取请求状态
+func (tm *TokenizerManager) GetRequestState(rid string) (*ReqState, bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	state, exists := tm.RIDToState[rid]
+	return state, exists
+}
+
+// DeleteRequestState 安全地删除请求状态
+func (tm *TokenizerManager) DeleteRequestState(rid string) {
+	tm.mu.Lock()
+	delete(tm.RIDToState, rid)
+	tm.mu.Unlock()
+
+	// 同时关闭对应的操作通道
+	tm.chanMu.Lock()
+	if ch, exists := tm.ridOpChans[rid]; exists {
+		close(ch)
+		delete(tm.ridOpChans, rid)
+		tm.logger.Infow("Closed and deleted operation channel", "rid", rid)
+	}
+	tm.chanMu.Unlock()
 }
