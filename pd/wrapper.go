@@ -109,6 +109,7 @@ type TokenizerManager struct {
 	// 添加 rid 操作通道映射
 	ridOpChans map[string]chan func()
 	chanMu     sync.RWMutex
+	pdRole     string // 添加 PD role 字段
 }
 
 // ReqState 存储每个请求的状态
@@ -124,10 +125,15 @@ type ReqState struct {
 }
 
 // NewTokenizerManager 创建新的TokenizerManager实例
-func NewTokenizerManager(leaderAddr, zmqPort string) (*TokenizerManager, error) {
+func NewTokenizerManager(leaderAddr, zmqPort, pdType string) (*TokenizerManager, error) {
 	context, err := zmq.NewContext()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zmq context: %v", err)
+	}
+
+	// 设置 PD role，如果未指定则默认为 decode
+	if pdType == "" {
+		pdType = "decode"
 	}
 
 	return &TokenizerManager{
@@ -137,6 +143,7 @@ func NewTokenizerManager(leaderAddr, zmqPort string) (*TokenizerManager, error) 
 		logger:     zLogger,
 		RIDToState: make(map[string]*ReqState),
 		ridOpChans: make(map[string]chan func()),
+		pdRole:     pdType,
 	}, nil
 }
 
@@ -408,11 +415,14 @@ func WrapperInit(cfg map[string]string) (err error) {
 		zmqPort = "10110"
 	}
 
+	// 检查PD模式
+	pdType := os.Getenv("AIGES_PD_ROLE")
+
 	leaderAddr := os.Getenv("LWS_LEADER_ADDRESS")
 	if leaderAddr != "" {
 		fmt.Printf("Start ZMQReceiver on %s:%s\n", leaderAddr, zmqPort)
 		var err error
-		tokenizerManager, err = NewTokenizerManager(leaderAddr, zmqPort)
+		tokenizerManager, err = NewTokenizerManager(leaderAddr, zmqPort, pdType)
 		if err != nil {
 			return fmt.Errorf("failed to create tokenizer manager: %v", err)
 		}
@@ -440,8 +450,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Metrics enabled")
 	}
 
-	// 检查PD模式
-	pdType := os.Getenv("AIGES_PD_ROLE")
 	isDecodeMode = true // 默认为decode模式
 	if pdType == "prefill" {
 		isDecodeMode = false
@@ -820,16 +828,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		// thinking := false
 		// if os.Getenv("IS_REASONING_MODEL") == "true" {
-		// 	if len(messages) > 0 {
-		// 		lastMsg := messages[len(messages)-1]
-		// 		if lastMsg.Role != "assistant" {
-		// 			messages = append(messages, openai.ChatCompletionMessage{
-		// 				Role:    "assistant",
-		// 				Content: "<think>\n",
-		// 			})
-		// 			thinking = true
-		// 		}
-		// 	}
+		//      if len(messages) > 0 {
+		//              lastMsg := messages[len(messages)-1]
+		//              if lastMsg.Role != "assistant" {
+		//                      messages = append(messages, openai.ChatCompletionMessage{
+		//                              Role:    "assistant",
+		//                              Content: "<think>\n",
+		//                      })
+		//                      thinking = true
+		//              }
+		//      }
 		// }
 
 		wLogger.Infow("Wrapper Send Engine messages", "messages", messages)
@@ -902,7 +910,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 
-			done := make(chan struct{})
 			var totalPromptTokens, totalCompletionTokens int
 
 			for {
@@ -912,7 +919,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						wLogger.Warnw("WrapperWrite stream timeout", "sid", inst.sid)
 						goto endLoop
 					}
-					close(done)
 					return
 				case <-state.Event:
 					// 使用 goroutine 调用 Recv，并处理异常
@@ -926,9 +932,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}()
 					// 获取最新的响应
 					if len(state.OutList) > 0 {
-						if index == 0 {
-							wLogger.Infow("Get First chunk ", "sid", inst.sid)
+						if inst.tokenizerManager.IsPrefillMode() {
+							goto endLoop
 						}
+						if index == 0 && inst.tokenizerManager.IsDecodeMode() {
+							wLogger.Infow("Decode mode Get First chunk ", "sid", inst.sid)
+						}
+
 						index++
 						lastOut := state.OutList[len(state.OutList)-1]
 						lastOutStr := state.OutStrList[len(state.OutStrList)-1]
@@ -1014,7 +1024,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			inst.SafeCloseStream()
 
 			if inst.active {
-				if !isDecodeMode {
+				if inst.tokenizerManager.IsPrefillMode() {
 					keepAliveData := comwrapper.WrapperData{
 						Key:      "__keepalive_down",
 						Data:     []byte{},
@@ -1025,15 +1035,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 
 					if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
-						wLogger.Errorw("WrapperWrite final keepalive_down callback error", "error", err, "sid", inst.sid)
+						wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
 					} else {
-						wLogger.Infow("WrapperWrite sent keepalive_down end", "sid", inst.sid)
+						wLogger.Infow("Prefill Mode get first chunk, sent keepalive_down signal", "sid", inst.sid)
 					}
 				}
 			}
 
-			wLogger.Infow("WrapperWrite sending end signal", "sid", inst.sid)
-			close(done)
+			wLogger.Infow("WrapperWrite End and send end signal", "sid", inst.sid)
 			inst.stopQ <- true
 		}(streamReq, v.Status)
 	}
@@ -1469,4 +1478,19 @@ func (tm *TokenizerManager) DeleteRequestState(rid string) {
 		tm.logger.Infow("Closed and deleted operation channel", "rid", rid)
 	}
 	tm.chanMu.Unlock()
+}
+
+// IsDecodeMode 判断是否为 decode 模式
+func (tm *TokenizerManager) IsDecodeMode() bool {
+	return tm.pdRole == "decode"
+}
+
+// IsPrefillMode 判断是否为 prefill 模式
+func (tm *TokenizerManager) IsPrefillMode() bool {
+	return tm.pdRole == "prefill"
+}
+
+// GetPDRole 获取当前 PD role
+func (tm *TokenizerManager) GetPDRole() string {
+	return tm.pdRole
 }
