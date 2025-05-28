@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,6 +190,14 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 	// 并发处理每个 rid，不需要等待完成
 	for i, rid := range batchOut.Rids {
 		go func(idx int, requestID string) {
+			defer func() {
+				if r := recover(); r != nil {
+					tm.logger.Errorw("Recovered from panic in HandleBatchOutput",
+						"error", r,
+						"rid", requestID,
+						"stack", string(debug.Stack()))
+				}
+			}()
 			// 先检查状态是否存在
 			tm.mu.RLock()
 			state, exists := tm.RIDToState[requestID]
