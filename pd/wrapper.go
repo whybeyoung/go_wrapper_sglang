@@ -118,7 +118,7 @@ type ReqState struct {
 	OutStrList   [][]byte // 存储每次的文本增量
 	Finished     bool
 	Event        chan struct{}
-	Obj          interface{}
+	Inst         *wrapperInst // 添加 wrapperInst 指针
 	CreatedTime  time.Time
 	FinishedTime time.Time
 	Text         string
@@ -189,6 +189,30 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 	// 并发处理每个 rid，不需要等待完成
 	for i, rid := range batchOut.Rids {
 		go func(idx int, requestID string) {
+			// 先检查状态是否存在
+			tm.mu.RLock()
+			state, exists := tm.RIDToState[requestID]
+			tm.mu.RUnlock()
+
+			if !exists {
+				tm.logger.Warnw("State not found for rid", "rid", requestID)
+				return
+			}
+
+			// 检查实例是否还处于活动状态
+			if state.Inst != nil && !state.Inst.active {
+				tm.logger.Warnw("Instance is not active, closing channel and exiting", "rid", requestID)
+				// 在这里关闭通道并清理
+				tm.chanMu.Lock()
+				if ch, exists := tm.ridOpChans[requestID]; exists {
+					close(ch)
+					delete(tm.ridOpChans, requestID)
+					tm.logger.Infow("Closed and deleted operation channel", "rid", requestID)
+				}
+				tm.chanMu.Unlock()
+				return
+			}
+
 			// 获取 rid 的操作通道
 			opChan := tm.getOrCreateRIDOpChan(requestID)
 
@@ -201,6 +225,12 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 
 				if !exists {
 					tm.logger.Warnw("Received output for rid but state was deleted", "rid", requestID)
+					return
+				}
+
+				// 再次检查实例是否还处于活动状态
+				if state.Inst != nil && !state.Inst.active {
+					tm.logger.Warnw("Instance became inactive during operation", "rid", requestID)
 					return
 				}
 
@@ -250,8 +280,19 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 					state.FinishedTime = time.Now()
 					metaInfo["e2e_latency"] = state.FinishedTime.Sub(state.CreatedTime).Seconds()
 
-					// 使用 DeleteRequestState 来确保状态和通道都被正确清理
-					tm.DeleteRequestState(requestID)
+					// 如果是正常完成，关闭通道并清理
+					tm.chanMu.Lock()
+					if ch, exists := tm.ridOpChans[requestID]; exists {
+						close(ch)
+						delete(tm.ridOpChans, requestID)
+						tm.logger.Infow("Closed and deleted operation channel due to completion", "rid", requestID)
+					}
+					tm.chanMu.Unlock()
+
+					// 删除状态
+					tm.mu.Lock()
+					delete(tm.RIDToState, requestID)
+					tm.mu.Unlock()
 				}
 
 				state.OutList = append(state.OutList, outDict)
@@ -318,10 +359,11 @@ func (tm *TokenizerManager) Stop() {
 }
 
 // AddRequest 添加新的请求
-func (tm *TokenizerManager) AddRequest(rid string) *ReqState {
+func (tm *TokenizerManager) AddRequest(rid string, inst *wrapperInst) *ReqState {
 	state := &ReqState{
 		CreatedTime: time.Now(),
 		Event:       make(chan struct{}, 1),
+		Inst:        inst, // 保存 wrapperInst 指针
 	}
 
 	tm.mu.Lock()
@@ -573,7 +615,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		tokenizerManager: tokenizerManager,
 	}
 	if inst.tokenizerManager != nil {
-		inst.tokenizerManager.AddRequest(inst.sid)
+		inst.tokenizerManager.AddRequest(inst.sid, inst) // 传入 inst 指针
 		wLogger.Infow("WrapperCreate added request state for decode mode", "sid", inst.sid)
 	}
 
@@ -1057,9 +1099,9 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	inst.active = false
 	inst.stopQ <- true
 
-	// 删除对应的状态
+	// 只删除状态，不关闭通道
 	if inst.tokenizerManager != nil {
-		inst.tokenizerManager.DeleteRequestState(inst.sid)
+		inst.tokenizerManager.DeleteState(inst.sid)
 		wLogger.Infow("WrapperDestroy deleted state", "sid", inst.sid)
 	}
 
@@ -1464,20 +1506,14 @@ func (tm *TokenizerManager) GetRequestState(rid string) (*ReqState, bool) {
 	return state, exists
 }
 
-// DeleteRequestState 安全地删除请求状态
-func (tm *TokenizerManager) DeleteRequestState(rid string) {
+// DeleteState 安全地删除请求状态
+func (tm *TokenizerManager) DeleteState(rid string) {
+	if tm == nil {
+		return
+	}
 	tm.mu.Lock()
 	delete(tm.RIDToState, rid)
 	tm.mu.Unlock()
-
-	// 同时关闭对应的操作通道
-	tm.chanMu.Lock()
-	if ch, exists := tm.ridOpChans[rid]; exists {
-		close(ch)
-		delete(tm.ridOpChans, rid)
-		tm.logger.Infow("Closed and deleted operation channel", "rid", rid)
-	}
-	tm.chanMu.Unlock()
 }
 
 // IsDecodeMode 判断是否为 decode 模式
