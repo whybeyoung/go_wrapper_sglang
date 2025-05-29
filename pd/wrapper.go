@@ -113,6 +113,7 @@ type wrapperInst struct {
 	SingleOutChan       chan SingleStrOut
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
 	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
+	thinkingMode        bool       // 添加标志位记录 thinking 模式
 }
 
 // todo move to single file
@@ -743,17 +744,36 @@ func (inst *wrapperInst) handleSingleOutChan() {
 			totalPromptTokens = singleOut.PromptTokens
 			totalCompletionTokens = singleOut.CompletionTokens
 
-			// 构建增量响应结构
-			chunkResponse := map[string]interface{}{
-				"choices": []map[string]interface{}{
-					{
-						"content":           singleOut.OutputStr,
-						"reasoning_content": "",
-						"index":             0,
-						"role":              "assistant",
+			var chunkResponse map[string]interface{}
+			if singleOut.OutputStr == "</think>" {
+				inst.thinkingMode = false
+				singleOut.OutputStr = ""
+			}
+			if inst.thinkingMode {
+				// 构建增量响应结构
+				chunkResponse = map[string]interface{}{
+					"choices": []map[string]interface{}{
+						{
+							"content":           "",
+							"reasoning_content": singleOut.OutputStr,
+							"index":             0,
+							"role":              "assistant",
+						},
 					},
-				},
-				"question_type": "",
+					"question_type": "",
+				}
+			} else {
+				chunkResponse = map[string]interface{}{
+					"choices": []map[string]interface{}{
+						{
+							"content":           singleOut.OutputStr,
+							"reasoning_content": "",
+							"index":             0,
+							"role":              "assistant",
+						},
+					},
+					"question_type": "",
+				}
 			}
 			chunkIndex++
 
@@ -976,19 +996,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 创建流式请求
 		messages := convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex))
 
-		// thinking := false
-		// if os.Getenv("IS_REASONING_MODEL") == "true" {
-		//      if len(messages) > 0 {
-		//              lastMsg := messages[len(messages)-1]
-		//              if lastMsg.Role != "assistant" {
-		//                      messages = append(messages, openai.ChatCompletionMessage{
-		//                              Role:    "assistant",
-		//                              Content: "<think>\n",
-		//                      })
-		//                      thinking = true
-		//              }
-		//      }
-		// }
+		if os.Getenv("IS_REASONING_MODEL") == "true" {
+			if len(messages) > 0 {
+				lastMsg := messages[len(messages)-1]
+				if lastMsg.Role != "assistant" {
+					messages = append(messages, openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "<think>\n",
+					})
+					inst.thinkingMode = true
+				}
+			}
+		}
 
 		wLogger.Infow("Wrapper Send Engine messages", "messages", messages)
 
@@ -1043,7 +1062,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			inst.Stream = stream
-			// defer inst.Stream.Close()
+			// defer inst.Stream.Close()t
 			// 这里轮询判断 inst.active , 默认调用下 Stream的 Recv
 			for inst.active {
 
