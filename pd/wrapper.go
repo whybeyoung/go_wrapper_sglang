@@ -109,6 +109,7 @@ type wrapperInst struct {
 	active              bool
 	SessionManager      *SessionManager
 	Stream              *openai.ChatCompletionStream
+	StopStreamChan      chan bool
 	SingleOutChan       chan SingleStrOut
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
 	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
@@ -608,6 +609,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		active:              true,
 		SessionManager:      sessionManager,
 		SingleOutChan:       make(chan SingleStrOut, dataChanBufferSize),
+		StopStreamChan:      make(chan bool, 2),
 		SingleOutChanClosed: false, // 使用大写开头的字段名
 	}
 	if inst.SessionManager != nil {
@@ -820,6 +822,8 @@ func (inst *wrapperInst) handleSingleOutChan() {
 			}
 		}
 	}
+	inst.StopStreamChan <- true // 发送关闭流信号 让上行关闭
+	close(inst.StopStreamChan)  // 关闭通道
 }
 
 // WrapperWrite 数据写入
@@ -1032,7 +1036,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			inst.Stream = stream
-			defer inst.SafeCloseStream()
+			defer inst.Stream.Close()
 			// 这里轮询判断 inst.active , 默认调用下 Stream的 Recv
 			for inst.active {
 
@@ -1044,6 +1048,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					if err := inst.callback(inst.usrTag, nil, err); err != nil {
 						wLogger.Errorw("WrapperWrite timeout callback failed", "error", err, "sid", inst.sid)
 					}
+					return
+				case <-inst.StopStreamChan:
+					wLogger.Infow("StopStreamChan received, closing stream", "sid", inst.sid)
+					inst.active = false
 					return
 				default:
 					if _, err := inst.Stream.Recv(); err != nil {
@@ -1064,6 +1072,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 func WrapperDestroy(hdl interface{}) (err error) {
 	inst := (*wrapperInst)(hdl.(unsafe.Pointer))
 	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
+	inst.StopStreamChan <- true
+
 	inst.active = false
 
 	// 只删除状态，不关闭通道
