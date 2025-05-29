@@ -1072,7 +1072,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 func WrapperDestroy(hdl interface{}) (err error) {
 	inst := (*wrapperInst)(hdl.(unsafe.Pointer))
 	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
-	inst.StopStreamChan <- true
 
 	inst.active = false
 
