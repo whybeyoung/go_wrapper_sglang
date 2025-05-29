@@ -706,6 +706,8 @@ func (inst *wrapperInst) handleSingleOutChan() {
 	var chunkIndex int = 0
 	var finished bool = false
 
+	defer inst.Stream.Close()
+
 	for {
 		if !inst.active {
 			wLogger.Infow("WrapperWrite Recv Goroutine exit", "sid", inst.sid)
@@ -733,7 +735,8 @@ func (inst *wrapperInst) handleSingleOutChan() {
 					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid)
 				}
 				// preifll 第一帧就结束 并发送释放信号
-				continue
+				inst.active = failed
+				return
 			}
 
 			// 累加 token 数量
@@ -822,6 +825,10 @@ func (inst *wrapperInst) handleSingleOutChan() {
 			}
 		}
 	}
+
+}
+
+func (inst *wrapperInst) closeStopStreamChan() {
 	inst.StopStreamChan <- true // 发送关闭流信号 让上行关闭
 	close(inst.StopStreamChan)  // 关闭通道
 }
@@ -1036,7 +1043,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			inst.Stream = stream
-			defer inst.Stream.Close()
+			// defer inst.Stream.Close()
 			// 这里轮询判断 inst.active , 默认调用下 Stream的 Recv
 			for inst.active {
 
@@ -1049,10 +1056,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						wLogger.Errorw("WrapperWrite timeout callback failed", "error", err, "sid", inst.sid)
 					}
 					return
-				case <-inst.StopStreamChan:
-					wLogger.Infow("StopStreamChan received, closing stream", "sid", inst.sid)
-					inst.active = false
-					return
+				// case <-inst.StopStreamChan:
+				// 	wLogger.Infow("StopStreamChan received, closing stream", "sid", inst.sid)
+				// 	inst.active = false
+				// 	return
 				default:
 					if _, err := inst.Stream.Recv(); err != nil {
 						wLogger.Warnw("Stream Recv error...", "error", err, "sid", inst.sid)
