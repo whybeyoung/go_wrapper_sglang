@@ -37,8 +37,8 @@ var (
 	logPath                     = "/log/app/wrapper.log"
 	zmqLogPath                  = "/log/app/zmqReceiver.log"
 	respKey                     = "content"
+	sessionManager              *SessionManager
 	requestManager              *RequestManager
-	tokenizerManager            *TokenizerManager
 	httpServerPort              int
 	isDecodeMode                bool         // 添加全局变量存储PD模式
 	promptSearchTemplate        string       // 添加全局变量存储搜索模板
@@ -98,6 +98,22 @@ type SingleStrOut struct {
 	OutputHiddenStates        []float64              `msgpack:"output_hidden_states"`
 }
 
+// wrapperInst 结构体定义
+type wrapperInst struct {
+	usrTag              string
+	sid                 string
+	client              *OpenAIClient
+	firstFrame          bool
+	callback            comwrapper.CallBackPtr
+	params              map[string]string
+	active              bool
+	SessionManager      *SessionManager
+	Stream              *openai.ChatCompletionStream
+	SingleOutChan       chan SingleStrOut
+	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
+	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
+}
+
 // todo move to single file
 type BatchStrOut struct {
 	Rids                      []string                 `msgpack:"rids"`
@@ -123,8 +139,8 @@ type BatchStrOut struct {
 	OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
 }
 
-// TokenizerManager 管理分词器和ZMQ通信
-type TokenizerManager struct {
+// SessionManager 管理分词器和ZMQ通信
+type SessionManager struct {
 	zmqContext *zmq.Context
 	zmqSocket  *zmq.Socket
 	zmqPort    string
@@ -143,26 +159,24 @@ type ReqState struct {
 	OutList      []map[string]interface{}
 	OutStrList   [][]byte // 存储每次的文本增量
 	Finished     bool
-	Event        chan struct{}
 	Inst         *wrapperInst // 添加 wrapperInst 指针
 	CreatedTime  time.Time
 	FinishedTime time.Time
 	Text         string
 }
 
-// NewTokenizerManager 创建新的TokenizerManager实例
-func NewTokenizerManager(leaderAddr, zmqPort, pdType string) (*TokenizerManager, error) {
+// NewSessionManager 创建新的SessionManager实例
+func NewSessionManager(leaderAddr, zmqPort, pdType string) (*SessionManager, error) {
 	context, err := zmq.NewContext()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zmq context: %v", err)
 	}
-
 	// 设置 PD role，如果未指定则默认为 decode
 	if pdType == "" {
 		pdType = "decode"
 	}
 
-	return &TokenizerManager{
+	return &SessionManager{
 		zmqContext: context,
 		zmqPort:    zmqPort,
 		leaderAddr: leaderAddr,
@@ -173,63 +187,34 @@ func NewTokenizerManager(leaderAddr, zmqPort, pdType string) (*TokenizerManager,
 	}, nil
 }
 
-// getOrCreateRIDOpChan 获取或创建 rid 的操作通道
-func (tm *TokenizerManager) getOrCreateRIDOpChan(rid string) chan func() {
-	tm.chanMu.Lock()
-	defer tm.chanMu.Unlock()
-
-	ch, exists := tm.ridOpChans[rid]
-	if !exists {
-		// 创建带缓冲的通道，缓冲区大小为100
-		ch = make(chan func(), 4096)
-		tm.ridOpChans[rid] = ch
-		// 启动操作处理协程
-		go tm.processRIDOps(rid, ch)
-	}
-	return ch
-}
-
-// processRIDOps 处理特定 rid 的操作
-func (tm *TokenizerManager) processRIDOps(rid string, ch chan func()) {
-	for {
-		select {
-		case op, ok := <-ch:
-			if !ok {
-				// channel 已关闭，退出处理
-				tm.logger.Infow("Operation channel closed, exiting processRIDOps", "rid", rid)
-				return
-			}
-			// 执行操作
-			op()
-		}
-	}
-}
-
 // HandleBatchOutput processes batch outputs from the tokenizer
-func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
+func (sm *SessionManager) HandleBatchOutput(data []byte) error {
 	var batchOut BatchStrOut
 	if err := msgpack.Unmarshal(data, &batchOut); err != nil {
 		return err
 	}
 	start := time.Now()
-	defer tm.logger.Infow("Handle batch output end", "cost", time.Since(start))
+	defer sm.logger.Infow("Handle batch output end", "cost", time.Since(start), "rids", strings.Join(batchOut.Rids, "|"))
 	// 并发处理每个 rid
 	for i, rid := range batchOut.Rids {
 		// TO do 这里需要优化，需要根据rid来获取state，而不是根据index 这里需要
 		func(idx int, requestID string) {
 			// 先检查状态是否存在
-			tm.mu.RLock()
-			state, exists := tm.RIDToState[requestID]
-			tm.mu.RUnlock()
+			sm.mu.RLock()
+			state, exists := sm.RIDToState[requestID]
+			sm.mu.RUnlock()
 
 			if !exists {
-				tm.logger.Warnw("State not found for rid", "rid", requestID)
+				sm.logger.Warnw("State not found for rid", "rid", requestID)
 				return
 			}
-
+			if state == nil {
+				sm.logger.Warnw("State nil for rid", "rid", requestID)
+				return
+			}
 			// 检查实例是否还处于活动状态
-			if state.Inst != nil && !state.Inst.active {
-				tm.logger.Warnw("Instance is not active", "rid", requestID)
+			if !state.Inst.active {
+				sm.logger.Warnw("Instance is not active", "rid", requestID)
 				return
 			}
 
@@ -299,18 +284,23 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 			}
 
 			// 发送到实例的通道
-			if state.Inst != nil && state.Inst.active {
+			if state.Inst.active {
 				select {
-				case <-state.Inst.closeSendChan:
-					tm.logger.Infow("Received close signal for SingleOutChan", "rid", requestID)
-					state.Inst.SafeCloseSingleOutChan()
-				default:
-					if !state.Inst.SafeSendToSingleOutChan(singleOut) {
-						tm.logger.Warnw("Failed to send to SingleOutChan", "rid", requestID)
-					} else {
-						tm.logger.Debugw("Sent SingleStrOut to instance channel", "rid", requestID)
-					}
+				case state.Inst.SingleOutChan <- singleOut:
+					// 发送成功
+					sm.logger.Debugw("Successfully sent data to SingleOutChan",
+						"rid", rid,
+						"chanLen", len(state.Inst.SingleOutChan),
+						"chanCap", cap(state.Inst.SingleOutChan))
 				}
+			} else {
+				state.Inst.chanMu.Lock()
+				if !state.Inst.SingleOutChanClosed {
+					close(state.Inst.SingleOutChan)
+					state.Inst.SingleOutChanClosed = true
+					wLogger.Infow("Instance is not active, close SingleOutChan For rid", "rid", rid)
+				}
+				state.Inst.chanMu.Unlock()
 			}
 		}(i, rid)
 	}
@@ -319,62 +309,61 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 }
 
 // receiveLoop 接收消息的循环
-func (tm *TokenizerManager) receiveLoop() {
+func (sm *SessionManager) receiveLoop() {
 	for {
-		msg, err := tm.zmqSocket.RecvBytes(0)
+		msg, err := sm.zmqSocket.RecvBytes(0)
 		if err != nil {
-			tm.logger.Errorw("Receive error:", "error", err)
+			sm.logger.Errorw("Receive error:", "error", err)
 			continue
 		}
 
 		// 使用协程处理消息，避免阻塞接收循环
 		func(message []byte) {
-			if err := tm.HandleBatchOutput(message); err != nil {
-				tm.logger.Errorw("Handle batch output error:", "error", err)
+			if err := sm.HandleBatchOutput(message); err != nil {
+				sm.logger.Errorw("Handle batch output error:", "error", err)
 			}
 		}(msg)
 	}
 }
 
 // Start 启动ZMQ接收器
-func (tm *TokenizerManager) Start() error {
-	socket, err := tm.zmqContext.NewSocket(zmq.PULL)
+func (sm *SessionManager) Start() error {
+	socket, err := sm.zmqContext.NewSocket(zmq.PULL)
 	if err != nil {
 		return fmt.Errorf("failed to create zmq socket: %v", err)
 	}
-	tm.zmqSocket = socket
+	sm.zmqSocket = socket
 
-	err = socket.Bind(fmt.Sprintf("tcp://*:%s", tm.zmqPort))
+	err = socket.Bind(fmt.Sprintf("tcp://*:%s", sm.zmqPort))
 	if err != nil {
 		return fmt.Errorf("failed to bind zmq socket: %v", err)
 	}
 
-	tm.logger.Infow("ZMQReceiver loop started...")
-	go tm.receiveLoop()
+	sm.logger.Infow("ZMQReceiver loop started...")
+	go sm.receiveLoop()
 	return nil
 }
 
 // Stop 停止ZMQ接收器
-func (tm *TokenizerManager) Stop() {
-	if tm.zmqSocket != nil {
-		tm.zmqSocket.Close()
+func (sm *SessionManager) Stop() {
+	if sm.zmqSocket != nil {
+		sm.zmqSocket.Close()
 	}
-	if tm.zmqContext != nil {
-		tm.zmqContext.Term()
+	if sm.zmqContext != nil {
+		sm.zmqContext.Term()
 	}
 }
 
 // AddRequest 添加新的请求
-func (tm *TokenizerManager) AddRequest(rid string, inst *wrapperInst) *ReqState {
+func (sm *SessionManager) AddRequest(rid string, inst *wrapperInst) *ReqState {
 	state := &ReqState{
 		CreatedTime: time.Now(),
-		Event:       make(chan struct{}, 1),
 		Inst:        inst, // 保存 wrapperInst 指针
 	}
 
-	tm.mu.Lock()
-	tm.RIDToState[rid] = state
-	tm.mu.Unlock()
+	sm.mu.Lock()
+	sm.RIDToState[rid] = state
+	sm.mu.Unlock()
 
 	return state
 }
@@ -470,12 +459,12 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if leaderAddr != "" {
 		fmt.Printf("Start ZMQReceiver on %s:%s\n", leaderAddr, zmqPort)
 		var err error
-		tokenizerManager, err = NewTokenizerManager(leaderAddr, zmqPort, pdType)
+		sessionManager, err = NewSessionManager(leaderAddr, zmqPort, pdType)
 		if err != nil {
 			return fmt.Errorf("failed to create tokenizer manager: %v", err)
 		}
 
-		if err := tokenizerManager.Start(); err != nil {
+		if err := sessionManager.Start(); err != nil {
 			return fmt.Errorf("failed to start tokenizer manager: %v", err)
 		}
 	}
@@ -610,21 +599,20 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 
 	// 创建新的实例
 	inst := &wrapperInst{
-		usrTag:           usrTag,
-		sid:              sid,
-		client:           requestManager.Client,
-		closeRecvChan:    make(chan bool, 4),
-		closeSendChan:    make(chan bool, 2),
-		firstFrame:       true,
-		callback:         cb,
-		params:           params,
-		active:           true,
-		tokenizerManager: tokenizerManager,
-		SingleOutChan:    make(chan SingleStrOut, dataChanBufferSize), // 使用大写开头的字段名
+		usrTag:              usrTag,
+		sid:                 sid,
+		client:              requestManager.Client,
+		firstFrame:          true,
+		callback:            cb,
+		params:              params,
+		active:              true,
+		SessionManager:      sessionManager,
+		SingleOutChan:       make(chan SingleStrOut, dataChanBufferSize),
+		SingleOutChanClosed: false, // 使用大写开头的字段名
 	}
-	if inst.tokenizerManager != nil {
-		inst.tokenizerManager.AddRequest(inst.sid, inst) // 传入 inst 指针
-		wLogger.Infow("WrapperCreate added request state for decode mode", "sid", inst.sid)
+	if inst.SessionManager != nil {
+		inst.SessionManager.AddRequest(inst.sid, inst) // 传入 inst 指针
+		wLogger.Infow("WrapperCreate added request state for pd mode", "sid", inst.sid)
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -693,53 +681,6 @@ func getLocalIP() string {
 	return localAddr.IP.String()
 }
 
-// wrapperInst 结构体定义
-type wrapperInst struct {
-	usrTag           string
-	sid              string
-	client           *OpenAIClient
-	closeRecvChan    chan bool
-	closeSendChan    chan bool
-	firstFrame       bool
-	callback         comwrapper.CallBackPtr
-	params           map[string]string
-	active           bool
-	tokenizerManager *TokenizerManager
-	Stream           *openai.ChatCompletionStream
-	SingleOutChan    chan SingleStrOut
-	chanMu           sync.Mutex // 添加互斥锁保护 channel 操作
-	chanClosed       bool       // 添加标志位记录 channel 状态
-}
-
-// SafeCloseSingleOutChan 安全地关闭 SingleOutChan
-func (inst *wrapperInst) SafeCloseSingleOutChan() {
-	inst.chanMu.Lock()
-	defer inst.chanMu.Unlock()
-
-	if !inst.chanClosed && inst.SingleOutChan != nil {
-		close(inst.SingleOutChan)
-		inst.chanClosed = true
-		wLogger.Infow("SingleOutChan safely closed", "sid", inst.sid)
-	}
-}
-
-// SafeSendToSingleOutChan 安全地发送数据到 SingleOutChan
-func (inst *wrapperInst) SafeSendToSingleOutChan(data SingleStrOut) bool {
-	inst.chanMu.Lock()
-	defer inst.chanMu.Unlock()
-
-	if inst.chanClosed || inst.SingleOutChan == nil {
-		return false
-	}
-
-	select {
-	case inst.SingleOutChan <- data:
-		return true
-	default:
-		return false
-	}
-}
-
 // SafeCloseStream 安全地关闭 stream
 func (inst *wrapperInst) SafeCloseStream() {
 	if inst.Stream == nil {
@@ -754,6 +695,131 @@ func (inst *wrapperInst) SafeCloseStream() {
 		inst.Stream.Close()
 	}()
 	inst.Stream = nil
+}
+
+// handleSingleOutChan 处理SingleOutChan的数据
+func (inst *wrapperInst) handleSingleOutChan() {
+	// 添加 token 计数变量
+	var totalPromptTokens, totalCompletionTokens int
+	var chunkIndex int = 0
+	var finished bool = false
+
+	for {
+		if !inst.active {
+			wLogger.Infow("WrapperWrite Recv Goroutine exit", "sid", inst.sid)
+			return
+		}
+		select {
+		case singleOut, ok := <-inst.SingleOutChan:
+			if !ok {
+				wLogger.Infow("SingleOutChan closed, exiting", "sid", inst.sid)
+				return
+			}
+			if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
+				keepAliveData := comwrapper.WrapperData{
+					Key:      "__keepalive_down",
+					Data:     []byte{},
+					Desc:     nil,
+					Encoding: "utf-8",
+					Type:     comwrapper.DataText,
+					Status:   comwrapper.DataEnd,
+				}
+
+				if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
+					wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
+				} else {
+					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid)
+				}
+				// preifll 第一帧就结束 并发送释放信号
+				continue
+			}
+
+			// 累加 token 数量
+			totalPromptTokens = singleOut.PromptTokens
+			totalCompletionTokens = singleOut.CompletionTokens
+
+			// 构建增量响应结构
+			chunkResponse := map[string]interface{}{
+				"choices": []map[string]interface{}{
+					{
+						"content":           singleOut.OutputStr,
+						"reasoning_content": "",
+						"index":             0,
+						"role":              "assistant",
+					},
+				},
+				"question_type": "",
+			}
+			chunkIndex++
+
+			// 序列化增量响应
+			chunkJSON, err := json.Marshal(chunkResponse)
+			if err != nil {
+				wLogger.Errorw("Failed to marshal chunk response", "error", err, "sid", inst.sid)
+				continue
+			}
+			// 创建响应数据切片
+			responseData := make([]comwrapper.WrapperData, 0, 2)
+
+			// 创建响应数据
+			contentData := comwrapper.WrapperData{
+				Key:      "content",
+				Data:     chunkJSON,
+				Desc:     nil,
+				Encoding: "utf-8",
+				Type:     comwrapper.DataText,
+				Status:   comwrapper.DataContinue,
+			}
+
+			// 检查是否完成
+			if singleOut.FinishedReason != nil {
+				contentData.Status = comwrapper.DataEnd
+
+				// 添加累计的 usage 信息
+				usageData := struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+					TotalTokens      int `json:"total_tokens"`
+					QuestionTokens   int `json:"question_tokens"`
+				}{
+					PromptTokens:     totalPromptTokens,
+					CompletionTokens: totalCompletionTokens,
+					TotalTokens:      totalPromptTokens + totalCompletionTokens,
+					QuestionTokens:   0,
+				}
+
+				usageJSON, err := json.Marshal(usageData)
+				if err != nil {
+					wLogger.Errorw("Failed to marshal usage data", "error", err, "sid", inst.sid)
+				} else {
+					// 将 usage 数据添加到响应中
+					usageWrapperData := comwrapper.WrapperData{
+						Key:      "usage",
+						Data:     usageJSON,
+						Desc:     nil,
+						Encoding: "utf-8",
+						Type:     comwrapper.DataText,
+						Status:   comwrapper.DataEnd,
+					}
+					responseData = append(responseData, usageWrapperData)
+					wLogger.Infow("WrapperWrite  End and send end signal, sending usage data", "sid", inst.sid, "usage", usageJSON)
+				}
+				// 最后一针需要 清理 inst 和 state
+				inst.active = false
+				finished = true
+			}
+
+			if finished {
+				contentData.Status = comwrapper.DataEnd
+			}
+			responseData = append(responseData, contentData)
+
+			// 发送响应数据
+			if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
+				wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+			}
+		}
+	}
 }
 
 // WrapperWrite 数据写入
@@ -775,7 +841,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	// 继续处理原有的请求逻辑
 	var pdInfo *PDInfo
 
-	if inst.tokenizerManager.IsPrefillMode() {
+	if inst.SessionManager.IsPrefillMode() {
 		pdInfo = getPDInfo()
 		wLogger.Infow("WrapperWrite Prefill generated PD info",
 			"sid", inst.sid,
@@ -868,131 +934,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	}
 
 	// 启动一个 goroutine 来处理 接收到的SingleOutChan 的数据
-	go func() {
-		// 添加 token 计数变量
-		var totalPromptTokens, totalCompletionTokens int
-		var chunkIndex int = 0
-		var finished bool = false
-		for {
-			select {
-			case singleOut, ok := <-inst.SingleOutChan:
-				if !ok {
-					wLogger.Infow("SingleOutChan closed, exiting", "sid", inst.sid)
-					return
-				}
-				if chunkIndex == 0 && inst.tokenizerManager.IsPrefillMode() {
-					keepAliveData := comwrapper.WrapperData{
-						Key:      "__keepalive_down",
-						Data:     []byte{},
-						Desc:     nil,
-						Encoding: "utf-8",
-						Type:     comwrapper.DataText,
-						Status:   comwrapper.DataEnd,
-					}
-
-					if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
-						wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
-					} else {
-						wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid)
-					}
-					inst.closeRecvChan <- true
-					// preifll 第一帧就结束 并发送释放信号
-					continue
-				}
-
-				// 累加 token 数量
-				totalPromptTokens = singleOut.PromptTokens
-				totalCompletionTokens = singleOut.CompletionTokens
-
-				// 构建增量响应结构
-				chunkResponse := map[string]interface{}{
-					"choices": []map[string]interface{}{
-						{
-							"content":           singleOut.OutputStr,
-							"reasoning_content": "",
-							"index":             0,
-							"role":              "assistant",
-						},
-					},
-					"question_type": "",
-				}
-				chunkIndex++
-
-				// 序列化增量响应
-				chunkJSON, err := json.Marshal(chunkResponse)
-				if err != nil {
-					wLogger.Errorw("Failed to marshal chunk response", "error", err, "sid", inst.sid)
-					continue
-				}
-				// 创建响应数据切片
-				responseData := make([]comwrapper.WrapperData, 0, 2)
-
-				// 创建响应数据
-				contentData := comwrapper.WrapperData{
-					Key:      "content",
-					Data:     chunkJSON,
-					Desc:     nil,
-					Encoding: "utf-8",
-					Type:     comwrapper.DataText,
-					Status:   comwrapper.DataContinue,
-				}
-
-				// 检查是否完成
-				if singleOut.FinishedReason != nil {
-					contentData.Status = comwrapper.DataEnd
-
-					// 添加累计的 usage 信息
-					usageData := struct {
-						PromptTokens     int `json:"prompt_tokens"`
-						CompletionTokens int `json:"completion_tokens"`
-						TotalTokens      int `json:"total_tokens"`
-						QuestionTokens   int `json:"question_tokens"`
-					}{
-						PromptTokens:     totalPromptTokens,
-						CompletionTokens: totalCompletionTokens,
-						TotalTokens:      totalPromptTokens + totalCompletionTokens,
-						QuestionTokens:   0,
-					}
-
-					usageJSON, err := json.Marshal(usageData)
-					if err != nil {
-						wLogger.Errorw("Failed to marshal usage data", "error", err, "sid", inst.sid)
-					} else {
-						// 将 usage 数据添加到响应中
-						usageWrapperData := comwrapper.WrapperData{
-							Key:      "usage",
-							Data:     usageJSON,
-							Desc:     nil,
-							Encoding: "utf-8",
-							Type:     comwrapper.DataText,
-							Status:   comwrapper.DataEnd,
-						}
-						responseData = append(responseData, usageWrapperData)
-						wLogger.Infow("WrapperWrite  End and send end signal, sending usage data", "sid", inst.sid, "usage", usageJSON)
-					}
-					// 最后一针需要 清理 inst 和 state
-					inst.active = false
-					inst.closeRecvChan <- true
-					finished = true
-				}
-
-				if finished {
-					contentData.Status = comwrapper.DataEnd
-				}
-				responseData = append(responseData, contentData)
-
-				// 发送响应数据
-				if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
-					wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
-				}
-
-			case <-inst.closeRecvChan:
-				wLogger.Infow("WrapperWrite Recv Goroutine received stop signal , set inst.active to false", "sid", inst.sid)
-				inst.active = false
-				return
-			}
-		}
-	}()
+	go inst.handleSingleOutChan()
 
 	for _, v := range req {
 		if v.Key == "__kv_info" {
@@ -1087,8 +1029,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				} else {
 					wLogger.Infow("WrapperWrite Upstream error callback success", "sid", inst.sid, "error", streamErr)
 				}
-				inst.closeRecvChan <- true
-				inst.closeSendChan <- true
 				return
 			}
 			inst.Stream = stream
@@ -1112,9 +1052,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 				}
 			}
-			// 实例已经不活跃了， 通知关闭zmq数据 方式chan
-			inst.closeSendChan <- true
-
+			// 实例已经不活跃了， 退出协程 清理 closeStgream
+			wLogger.Infow("Write Upstream Stream stopped", "sid", inst.sid)
 		}(streamReq, v.Status)
 	}
 
@@ -1126,11 +1065,10 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	inst := (*wrapperInst)(hdl.(unsafe.Pointer))
 	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
 	inst.active = false
-	inst.closeRecvChan <- true
 
 	// 只删除状态，不关闭通道
-	if inst.tokenizerManager != nil {
-		inst.tokenizerManager.DeleteState(inst.sid)
+	if inst.SessionManager != nil {
+		inst.SessionManager.DeleteState(inst.sid)
 		wLogger.Infow("WrapperDestroy deleted state", "sid", inst.sid)
 	}
 
@@ -1528,34 +1466,34 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 }
 
 // GetRequestState 安全地获取请求状态
-func (tm *TokenizerManager) GetRequestState(rid string) (*ReqState, bool) {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	state, exists := tm.RIDToState[rid]
+func (sm *SessionManager) GetRequestState(rid string) (*ReqState, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	state, exists := sm.RIDToState[rid]
 	return state, exists
 }
 
 // DeleteState 安全地删除请求状态
-func (tm *TokenizerManager) DeleteState(rid string) {
-	if tm == nil {
+func (sm *SessionManager) DeleteState(rid string) {
+	if sm == nil {
 		return
 	}
-	tm.mu.Lock()
-	delete(tm.RIDToState, rid)
-	tm.mu.Unlock()
+	sm.mu.Lock()
+	delete(sm.RIDToState, rid)
+	sm.mu.Unlock()
 }
 
 // IsDecodeMode 判断是否为 decode 模式
-func (tm *TokenizerManager) IsDecodeMode() bool {
-	return tm.pdRole == "decode"
+func (sm *SessionManager) IsDecodeMode() bool {
+	return sm.pdRole == "decode"
 }
 
 // IsPrefillMode 判断是否为 prefill 模式
-func (tm *TokenizerManager) IsPrefillMode() bool {
-	return tm.pdRole == "prefill"
+func (sm *SessionManager) IsPrefillMode() bool {
+	return sm.pdRole == "prefill"
 }
 
 // GetPDRole 获取当前 PD role
-func (tm *TokenizerManager) GetPDRole() string {
-	return tm.pdRole
+func (sm *SessionManager) GetPDRole() string {
+	return sm.pdRole
 }
