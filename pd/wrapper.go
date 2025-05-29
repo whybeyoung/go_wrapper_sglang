@@ -211,11 +211,12 @@ func (tm *TokenizerManager) HandleBatchOutput(data []byte) error {
 	if err := msgpack.Unmarshal(data, &batchOut); err != nil {
 		return err
 	}
-	tm.logger.Infow("Handle batch output", "rids", strings.Join(batchOut.Rids, "|"))
-
+	start := time.Now()
+	defer tm.logger.Infow("Handle batch output end", "cost", time.Since(start))
 	// 并发处理每个 rid
 	for i, rid := range batchOut.Rids {
-		go func(idx int, requestID string) {
+		// TO do 这里需要优化，需要根据rid来获取state，而不是根据index 这里需要
+		func(idx int, requestID string) {
 			// 先检查状态是否存在
 			tm.mu.RLock()
 			state, exists := tm.RIDToState[requestID]
@@ -871,6 +872,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 添加 token 计数变量
 		var totalPromptTokens, totalCompletionTokens int
 		var chunkIndex int = 0
+		var finished bool = false
 		for {
 			select {
 			case singleOut, ok := <-inst.SingleOutChan:
@@ -878,8 +880,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					wLogger.Infow("SingleOutChan closed, exiting", "sid", inst.sid)
 					return
 				}
-				chunkIndex++
-				if chunkIndex == 1 && inst.tokenizerManager.IsPrefillMode() {
+				if chunkIndex == 0 && inst.tokenizerManager.IsPrefillMode() {
 					keepAliveData := comwrapper.WrapperData{
 						Key:      "__keepalive_down",
 						Data:     []byte{},
@@ -900,8 +901,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				}
 
 				// 累加 token 数量
-				totalPromptTokens += singleOut.PromptTokens
-				totalCompletionTokens += singleOut.CompletionTokens
+				totalPromptTokens = singleOut.PromptTokens
+				totalCompletionTokens = singleOut.CompletionTokens
 
 				// 构建增量响应结构
 				chunkResponse := map[string]interface{}{
@@ -909,12 +910,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						{
 							"content":           singleOut.OutputStr,
 							"reasoning_content": "",
-							"index":             chunkIndex,
+							"index":             0,
 							"role":              "assistant",
 						},
 					},
 					"question_type": "",
 				}
+				chunkIndex++
 
 				// 序列化增量响应
 				chunkJSON, err := json.Marshal(chunkResponse)
@@ -971,7 +973,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					// 最后一针需要 清理 inst 和 state
 					inst.active = false
 					inst.closeRecvChan <- true
+					finished = true
 				}
+
+				if finished {
+					contentData.Status = comwrapper.DataEnd
+				}
+				responseData = append(responseData, contentData)
 
 				// 发送响应数据
 				if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
