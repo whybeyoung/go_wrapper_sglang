@@ -736,7 +736,7 @@ func (inst *wrapperInst) handleSingleOutChan() {
 					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid)
 				}
 				// preifll 第一帧就结束 并发送释放信号
-				inst.active = failed
+				inst.active = false
 				return
 			}
 
