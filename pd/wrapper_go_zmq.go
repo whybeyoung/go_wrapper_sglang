@@ -40,10 +40,10 @@ var (
 	sessionManager              *SessionManager
 	requestManager              *RequestManager
 	httpServerPort              int
-	isDecodeMode                bool         // 添加全局变量存储PD模式
-	promptSearchTemplate        string       // 添加全局变量存储搜索模板
-	promptSearchTemplateNoIndex string       // 添加全局变量存储不带索引的搜索模板
-	dataChanBufferSize          = 1024 * 128 // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
+	isDecodeMode                bool        // 添加全局变量存储PD模式
+	promptSearchTemplate        string      // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex string      // 添加全局变量存储不带索引的搜索模板
+	dataChanBufferSize          = 1024 * 64 // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
 )
 
 // RequestManager 请求管理器
@@ -76,40 +76,40 @@ func NewRequestManager(client *OpenAIClient) *RequestManager {
 
 // SingleStrOut 单个请求的输出结构
 type SingleStrOut struct {
-	FinishedReason            map[string]interface{} `msgpack:"finished_reason"`
-	OutputStr                 string                 `msgpack:"output_str"`
-	OutputID                  int                    `msgpack:"output_id"`
-	PromptTokens              int                    `msgpack:"prompt_tokens"`
-	CompletionTokens          int                    `msgpack:"completion_tokens"`
-	CachedTokens              int                    `msgpack:"cached_tokens"`
-	SpecVerifyCt              int                    `msgpack:"spec_verify_ct"`
-	InputTokenLogprobsVal     float64                `msgpack:"input_token_logprobs_val"`
-	InputTokenLogprobsIdx     int                    `msgpack:"input_token_logprobs_idx"`
-	OutputTokenLogprobsVal    float64                `msgpack:"output_token_logprobs_val"`
-	OutputTokenLogprobsIdx    int                    `msgpack:"output_token_logprobs_idx"`
-	InputTopLogprobsVal       []interface{}          `msgpack:"input_top_logprobs_val"`
-	InputTopLogprobsIdx       []interface{}          `msgpack:"input_top_logprobs_idx"`
-	OutputTopLogprobsVal      []interface{}          `msgpack:"output_top_logprobs_val"`
-	OutputTopLogprobsIdx      []interface{}          `msgpack:"output_top_logprobs_idx"`
-	InputTokenIdsLogprobsVal  []interface{}          `msgpack:"input_token_ids_logprobs_val"`
-	InputTokenIdsLogprobsIdx  []interface{}          `msgpack:"input_token_ids_logprobs_idx"`
-	OutputTokenIdsLogprobsVal []interface{}          `msgpack:"output_token_ids_logprobs_val"`
-	OutputTokenIdsLogprobsIdx []interface{}          `msgpack:"output_token_ids_logprobs_idx"`
-	OutputHiddenStates        []float64              `msgpack:"output_hidden_states"`
+	FinishedReason   map[string]interface{} `msgpack:"finished_reason"`
+	OutputStr        string                 `msgpack:"output_str"`
+	OutputID         int                    `msgpack:"output_id"`
+	PromptTokens     int                    `msgpack:"prompt_tokens"`
+	CompletionTokens int                    `msgpack:"completion_tokens"`
+	CachedTokens     int                    `msgpack:"cached_tokens"`
+	SpecVerifyCt     int                    `msgpack:"spec_verify_ct"`
+	// InputTokenLogprobsVal     float64                `msgpack:"input_token_logprobs_val"`
+	// InputTokenLogprobsIdx     int                    `msgpack:"input_token_logprobs_idx"`
+	// OutputTokenLogprobsVal    float64                `msgpack:"output_token_logprobs_val"`
+	// OutputTokenLogprobsIdx    int                    `msgpack:"output_token_logprobs_idx"`
+	// InputTopLogprobsVal       []interface{}          `msgpack:"input_top_logprobs_val"`
+	// InputTopLogprobsIdx       []interface{}          `msgpack:"input_top_logprobs_idx"`
+	// OutputTopLogprobsVal      []interface{}          `msgpack:"output_top_logprobs_val"`
+	// OutputTopLogprobsIdx      []interface{}          `msgpack:"output_top_logprobs_idx"`
+	// InputTokenIdsLogprobsVal  []interface{}          `msgpack:"input_token_ids_logprobs_val"`
+	// InputTokenIdsLogprobsIdx  []interface{}          `msgpack:"input_token_ids_logprobs_idx"`
+	// OutputTokenIdsLogprobsVal []interface{}          `msgpack:"output_token_ids_logprobs_val"`
+	// OutputTokenIdsLogprobsIdx []interface{}          `msgpack:"output_token_ids_logprobs_idx"`
+	// OutputHiddenStates        []float64              `msgpack:"output_hidden_states"`
 }
 
 // wrapperInst 结构体定义
 type wrapperInst struct {
-	usrTag              string
-	sid                 string
-	client              *OpenAIClient
-	firstFrame          bool
-	callback            comwrapper.CallBackPtr
-	params              map[string]string
-	active              bool
-	SessionManager      *SessionManager
-	Stream              *openai.ChatCompletionStream
-	StopStreamChan      chan bool
+	usrTag         string
+	sid            string
+	client         *OpenAIClient
+	firstFrame     bool
+	callback       comwrapper.CallBackPtr
+	params         map[string]string
+	active         bool
+	SessionManager *SessionManager
+	Stream         *openai.ChatCompletionStream
+	// StopStreamChan      chan bool
 	SingleOutChan       chan SingleStrOut
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
 	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
@@ -118,27 +118,27 @@ type wrapperInst struct {
 
 // todo move to single file
 type BatchStrOut struct {
-	Rids                      []string                 `msgpack:"rids"`
-	FinishedReasons           []map[string]interface{} `msgpack:"finished_reasons"`
-	OutputStrs                []string                 `msgpack:"output_strs"`
-	OutputIds                 []int                    `msgpack:"output_ids"`
-	PromptTokens              []int                    `msgpack:"prompt_tokens"`
-	CompletionTokens          []int                    `msgpack:"completion_tokens"`
-	CachedTokens              []int                    `msgpack:"cached_tokens"`
-	SpecVerifyCt              []int                    `msgpack:"spec_verify_ct"`
-	InputTokenLogprobsVal     []float64                `msgpack:"input_token_logprobs_val"`
-	InputTokenLogprobsIdx     []int                    `msgpack:"input_token_logprobs_idx"`
-	OutputTokenLogprobsVal    []float64                `msgpack:"output_token_logprobs_val"`
-	OutputTokenLogprobsIdx    []int                    `msgpack:"output_token_logprobs_idx"`
-	InputTopLogprobsVal       [][]interface{}          `msgpack:"input_top_logprobs_val"`
-	InputTopLogprobsIdx       [][]interface{}          `msgpack:"input_top_logprobs_idx"`
-	OutputTopLogprobsVal      [][]interface{}          `msgpack:"output_top_logprobs_val"`
-	OutputTopLogprobsIdx      [][]interface{}          `msgpack:"output_top_logprobs_idx"`
-	InputTokenIdsLogprobsVal  [][]interface{}          `msgpack:"input_token_ids_logprobs_val"`
-	InputTokenIdsLogprobsIdx  [][]interface{}          `msgpack:"input_token_ids_logprobs_idx"`
-	OutputTokenIdsLogprobsVal [][]interface{}          `msgpack:"output_token_ids_logprobs_val"`
-	OutputTokenIdsLogprobsIdx [][]interface{}          `msgpack:"output_token_ids_logprobs_idx"`
-	OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
+	Rids             []string                 `msgpack:"rids"`
+	FinishedReasons  []map[string]interface{} `msgpack:"finished_reasons"`
+	OutputStrs       []string                 `msgpack:"output_strs"`
+	OutputIds        []int                    `msgpack:"output_ids"`
+	PromptTokens     []int                    `msgpack:"prompt_tokens"`
+	CompletionTokens []int                    `msgpack:"completion_tokens"`
+	CachedTokens     []int                    `msgpack:"cached_tokens"`
+	SpecVerifyCt     []int                    `msgpack:"spec_verify_ct"`
+	// InputTokenLogprobsVal     []float64                `msgpack:"input_token_logprobs_val"`
+	// InputTokenLogprobsIdx     []int                    `msgpack:"input_token_logprobs_idx"`
+	// OutputTokenLogprobsVal    []float64                `msgpack:"output_token_logprobs_val"`
+	// OutputTokenLogprobsIdx    []int                    `msgpack:"output_token_logprobs_idx"`
+	// InputTopLogprobsVal       [][]interface{}          `msgpack:"input_top_logprobs_val"`
+	// InputTopLogprobsIdx       [][]interface{}          `msgpack:"input_top_logprobs_idx"`
+	// OutputTopLogprobsVal      [][]interface{}          `msgpack:"output_top_logprobs_val"`
+	// OutputTopLogprobsIdx      [][]interface{}          `msgpack:"output_top_logprobs_idx"`
+	// InputTokenIdsLogprobsVal  [][]interface{}          `msgpack:"input_token_ids_logprobs_val"`
+	// InputTokenIdsLogprobsIdx  [][]interface{}          `msgpack:"input_token_ids_logprobs_idx"`
+	// OutputTokenIdsLogprobsVal [][]interface{}          `msgpack:"output_token_ids_logprobs_val"`
+	// OutputTokenIdsLogprobsIdx [][]interface{}          `msgpack:"output_token_ids_logprobs_idx"`
+	// OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
 }
 
 // SessionManager 管理分词器和ZMQ通信
@@ -245,45 +245,45 @@ func (sm *SessionManager) HandleBatchOutput(data []byte) error {
 			if idx < len(batchOut.SpecVerifyCt) {
 				singleOut.SpecVerifyCt = batchOut.SpecVerifyCt[idx]
 			}
-			if idx < len(batchOut.InputTokenLogprobsVal) {
-				singleOut.InputTokenLogprobsVal = batchOut.InputTokenLogprobsVal[idx]
-			}
-			if idx < len(batchOut.InputTokenLogprobsIdx) {
-				singleOut.InputTokenLogprobsIdx = batchOut.InputTokenLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.OutputTokenLogprobsVal) {
-				singleOut.OutputTokenLogprobsVal = batchOut.OutputTokenLogprobsVal[idx]
-			}
-			if idx < len(batchOut.OutputTokenLogprobsIdx) {
-				singleOut.OutputTokenLogprobsIdx = batchOut.OutputTokenLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.InputTopLogprobsVal) {
-				singleOut.InputTopLogprobsVal = batchOut.InputTopLogprobsVal[idx]
-			}
-			if idx < len(batchOut.InputTopLogprobsIdx) {
-				singleOut.InputTopLogprobsIdx = batchOut.InputTopLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.OutputTopLogprobsVal) {
-				singleOut.OutputTopLogprobsVal = batchOut.OutputTopLogprobsVal[idx]
-			}
-			if idx < len(batchOut.OutputTopLogprobsIdx) {
-				singleOut.OutputTopLogprobsIdx = batchOut.OutputTopLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.InputTokenIdsLogprobsVal) {
-				singleOut.InputTokenIdsLogprobsVal = batchOut.InputTokenIdsLogprobsVal[idx]
-			}
-			if idx < len(batchOut.InputTokenIdsLogprobsIdx) {
-				singleOut.InputTokenIdsLogprobsIdx = batchOut.InputTokenIdsLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.OutputTokenIdsLogprobsVal) {
-				singleOut.OutputTokenIdsLogprobsVal = batchOut.OutputTokenIdsLogprobsVal[idx]
-			}
-			if idx < len(batchOut.OutputTokenIdsLogprobsIdx) {
-				singleOut.OutputTokenIdsLogprobsIdx = batchOut.OutputTokenIdsLogprobsIdx[idx]
-			}
-			if idx < len(batchOut.OutputHiddenStates) {
-				singleOut.OutputHiddenStates = batchOut.OutputHiddenStates[idx]
-			}
+			// if idx < len(batchOut.InputTokenLogprobsVal) {
+			// 	singleOut.InputTokenLogprobsVal = batchOut.InputTokenLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.InputTokenLogprobsIdx) {
+			// 	singleOut.InputTokenLogprobsIdx = batchOut.InputTokenLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.OutputTokenLogprobsVal) {
+			// 	singleOut.OutputTokenLogprobsVal = batchOut.OutputTokenLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.OutputTokenLogprobsIdx) {
+			// 	singleOut.OutputTokenLogprobsIdx = batchOut.OutputTokenLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.InputTopLogprobsVal) {
+			// 	singleOut.InputTopLogprobsVal = batchOut.InputTopLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.InputTopLogprobsIdx) {
+			// 	singleOut.InputTopLogprobsIdx = batchOut.InputTopLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.OutputTopLogprobsVal) {
+			// 	singleOut.OutputTopLogprobsVal = batchOut.OutputTopLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.OutputTopLogprobsIdx) {
+			// 	singleOut.OutputTopLogprobsIdx = batchOut.OutputTopLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.InputTokenIdsLogprobsVal) {
+			// 	singleOut.InputTokenIdsLogprobsVal = batchOut.InputTokenIdsLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.InputTokenIdsLogprobsIdx) {
+			// 	singleOut.InputTokenIdsLogprobsIdx = batchOut.InputTokenIdsLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.OutputTokenIdsLogprobsVal) {
+			// 	singleOut.OutputTokenIdsLogprobsVal = batchOut.OutputTokenIdsLogprobsVal[idx]
+			// }
+			// if idx < len(batchOut.OutputTokenIdsLogprobsIdx) {
+			// 	singleOut.OutputTokenIdsLogprobsIdx = batchOut.OutputTokenIdsLogprobsIdx[idx]
+			// }
+			// if idx < len(batchOut.OutputHiddenStates) {
+			// 	singleOut.OutputHiddenStates = batchOut.OutputHiddenStates[idx]
+			// }
 
 			// 发送到实例的通道
 			if state.Inst.active {
@@ -601,16 +601,16 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 
 	// 创建新的实例
 	inst := &wrapperInst{
-		usrTag:              usrTag,
-		sid:                 sid,
-		client:              requestManager.Client,
-		firstFrame:          true,
-		callback:            cb,
-		params:              params,
-		active:              true,
-		SessionManager:      sessionManager,
-		SingleOutChan:       make(chan SingleStrOut, dataChanBufferSize),
-		StopStreamChan:      make(chan bool, 2),
+		usrTag:         usrTag,
+		sid:            sid,
+		client:         requestManager.Client,
+		firstFrame:     true,
+		callback:       cb,
+		params:         params,
+		active:         true,
+		SessionManager: sessionManager,
+		SingleOutChan:  make(chan SingleStrOut, dataChanBufferSize),
+		// StopStreamChan:      make(chan bool, 2),
 		SingleOutChanClosed: false, // 使用大写开头的字段名
 	}
 	if inst.SessionManager != nil {
@@ -731,6 +731,10 @@ func (inst *wrapperInst) handleRidResponse() {
 			var chunkResponse map[string]interface{}
 			if singleOut.OutputStr == "</think>" {
 				inst.thinkingMode = false
+				singleOut.OutputStr = ""
+			}
+			if singleOut.OutputStr == "<think>" && chunkIndex == 0 {
+				inst.thinkingMode = true
 				singleOut.OutputStr = ""
 			}
 			if inst.thinkingMode {
@@ -923,13 +927,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			Type:     comwrapper.DataText,
 			Status:   comwrapper.DataBegin,
 		}
-
+		go func() {
+			// 按顺序发送所有数据
+			if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{kvContent, messagesContent, keepAliveBegin}, nil); err != nil {
+				wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+			}
+			wLogger.Infow("WrapperWrite sent kv_info, messages and keepalive_down begin", "sid", inst.sid)
+		}()
 		// 按顺序发送所有数据
-		if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{kvContent, messagesContent, keepAliveBegin}, nil); err != nil {
-			wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
-			return err
-		}
-		wLogger.Infow("WrapperWrite sent kv_info, messages and keepalive_down begin", "sid", inst.sid)
+		// time.Sleep(time.Millisecond * 1)
+
+		// if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{kvContent, messagesContent, keepAliveBegin}, nil); err != nil {
+		// 	wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+		// }
+		// wLogger.Infow("WrapperWrite sent kv_info, messages and keepalive_down begin", "sid", inst.sid)
+
 	} else {
 		// 如果是decode模式，从kv_info中获取PD信息
 		for _, v := range req {
@@ -1085,7 +1097,10 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
 
 	inst.active = false
-
+	if !inst.SingleOutChanClosed {
+		inst.SingleOutChanClosed = true
+		close(inst.SingleOutChan)
+	}
 	// 只删除状态，不关闭通道
 	if inst.SessionManager != nil {
 		inst.SessionManager.DeleteState(inst.sid)
@@ -1293,7 +1308,9 @@ func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
 	timeBase := time.Now().UnixNano()
 	// 将时间戳右移20位，保留高位，避免ID增长过快
 	timeBase = timeBase >> 20
-	offset := (ipHash * (1 << 32)) + (int64(port) * (1 << 16)) + timeBase
+	// 添加一个随机因子，使用纳秒时间戳的低32位
+	randomFactor := time.Now().UnixNano() & ((1 << 32) - 1)
+	offset := (ipHash * (1 << 32)) + (int64(port) * (1 << 16)) + timeBase + randomFactor
 
 	return &CircularIDAllocator{
 		MinID:     0,
@@ -1311,14 +1328,6 @@ func NewCircularIDAllocator(mockIP string, port int) *CircularIDAllocator {
 func (a *CircularIDAllocator) Allocate() int64 {
 	a.Lock.Lock()
 	defer a.Lock.Unlock()
-
-	// 获取当前时间戳并右移20位
-	currentTime := time.Now().UnixNano() >> 20
-	// 如果时间基准发生变化，更新Offset
-	if currentTime != a.TimeBase {
-		a.TimeBase = currentTime
-		a.Offset = (a.IPHash * (1 << 32)) + (int64(a.Port) * (1 << 16)) + currentTime
-	}
 
 	allocatedID := a.CurrentID + a.Offset
 	a.CurrentID++
