@@ -40,10 +40,11 @@ var (
 	sessionManager              *SessionManager
 	requestManager              *RequestManager
 	httpServerPort              int
-	isDecodeMode                bool        // 添加全局变量存储PD模式
-	promptSearchTemplate        string      // 添加全局变量存储搜索模板
-	promptSearchTemplateNoIndex string      // 添加全局变量存储不带索引的搜索模板
-	dataChanBufferSize          = 1024 * 64 // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
+	isDecodeMode                bool               // 添加全局变量存储PD模式
+	promptSearchTemplate        string             // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex string             // 添加全局变量存储不带索引的搜索模板
+	dataChanBufferSize          = 1024 * 64        // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
+	timeDDL                     = 60 * time.Minute // 超时时间
 )
 
 // RequestManager 请求管理器
@@ -1041,11 +1042,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
+		// prefill 首桢已经check过， 且无错误
+		firstChunkResponseChecked := false
+
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite Upstream starting stream inference", "sid", inst.sid)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), timeDDL)
 			defer cancel()
 
 			stream, streamErr := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
@@ -1079,7 +1083,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				default:
 					if _, err := inst.Stream.Recv(); err != nil {
 						wLogger.Debugw("Stream Recv error...", "error", err, "sid", inst.sid)
+						if !firstChunkResponseChecked {
+							// 第一帧就报错了，比如是 超长了
+							inst.active = false
+							if err := inst.callback(inst.usrTag, nil, err); err != nil {
+								wLogger.Errorw("Prefill error...", "error", err, "sid", inst.sid)
+							}
+						}
 						return
+					} else {
+						firstChunkResponseChecked = true
 					}
 				}
 			}
@@ -1362,7 +1375,7 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 	config := openai.DefaultConfig("maas")
 	config.BaseURL = baseURL
 	config.HTTPClient = &http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: timeDDL,
 		Transport: &http.Transport{
 			MaxIdleConns:        6000,
 			MaxIdleConnsPerHost: 3000,
