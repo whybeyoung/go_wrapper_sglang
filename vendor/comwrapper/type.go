@@ -30,4 +30,5 @@ type WrapperData struct {
 const (
 	FuncTraceLog CustomFuncType = 0
 	FuncMeter    CustomFuncType = 1
+	FuncLbExtra  CustomFuncType = 4
 )

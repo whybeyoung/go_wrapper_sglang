@@ -21,6 +21,7 @@ import (
 
 	"git.iflytek.com/AIaaS/xsf/utils"
 	"github.com/whybeyoung/go-openai"
+	gwsUtils "github.com/whybeyoung/go_wrapper_sglang/utils"
 )
 
 var (
@@ -45,6 +46,7 @@ var (
 
 var traceFunc func(usrTag string, key string, value string) (code int)
 var meterFunc func(usrTag string, key string, count int) (code int)
+var LbExtraFunc func(params map[string]string) error
 
 const (
 	R1_THINK_START              = "<think>"
@@ -173,6 +175,12 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Metrics enabled")
 	}
 
+	// 检查是否启用tools
+	toolCallParser := os.Getenv("TOOL_CALL_PARSER")
+	if len(toolCallParser) > 0 {
+		extraArgs += fmt.Sprintf(" --tool-call-parser %v ", toolCallParser)
+	}
+
 	// 检查多节点模式
 	enableMultiNode := os.Getenv("ENABLE_MULTI_NODE_MODE")
 	if enableMultiNode == "true" {
@@ -206,6 +214,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		"--port", strconv.Itoa(httpServerPort),
 		"--trust-remote",
 		"--host", "0.0.0.0",
+		"--enable-metrics",
 	}
 	// 添加额外参数
 	args = append(args, strings.Fields(extraArgs)...)
@@ -252,6 +261,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 		return fmt.Errorf("server failed to start: %v", err)
 	}
 
+	// sglang指标上报
+	//go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort))
+
 	// 初始化OpenAI客户端
 	serverURL := fmt.Sprintf("http://127.0.0.1:%d/v1", httpServerPort)
 	client := NewOpenAIClient(serverURL)
@@ -261,6 +273,42 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	wLogger.Debugw("WrapperInit successful")
 	return
+}
+
+func reportSglangMetrics(serverMetricURL string) {
+	wLogger.Debugw("sglang metric start")
+	httpClient := http.Client{
+		Timeout: time.Second,
+	}
+	sleepInterval := time.Second
+	for {
+
+		resp, err := httpClient.Get(serverMetricURL)
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+			time.Sleep(sleepInterval)
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+			time.Sleep(sleepInterval)
+			continue
+		}
+		wLogger.Debugw("sglang metric", "resp", string(body))
+		sglangMetrics := gwsUtils.ParseMetrics(string(body))
+		res := make(map[string]string, len(sglangMetrics))
+		for k, v := range sglangMetrics {
+			str, _ := json.Marshal(v)
+			res[k] = string(str)
+		}
+		err = LbExtraFunc(res)
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+		}
+		time.Sleep(sleepInterval)
+	}
 }
 
 // waitServerReady 等待服务器就绪
@@ -339,15 +387,20 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	return unsafe.Pointer(inst), nil
 }
 
-func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string) (comwrapper.WrapperData, error) {
+func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall) (comwrapper.WrapperData, error) {
+
+	choice := map[string]interface{}{
+		"content":           text,
+		"reasoning_content": resoning_content,
+		"index":             0,
+		"role":              "assistant",
+	}
+	if len(function_call) > 0 {
+		choice["function_call"] = function_call
+	}
 	result := map[string]interface{}{
 		"choices": []map[string]interface{}{
-			{
-				"content":           text,
-				"reasoning_content": resoning_content,
-				"index":             0,
-				"role":              "assistant",
-			},
+			choice,
 		},
 		"question_type": "",
 	}
@@ -398,7 +451,7 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 		responseError(inst, err)
 		return err
 	}
-	content, err := responseContent(status, index, "", "")
+	content, err := responseContent(status, index, "", "", nil)
 	if err != nil {
 		responseError(inst, err)
 		return err
@@ -415,6 +468,63 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 func toString(v any) string {
 	res, _ := json.Marshal(v)
 	return string(res)
+}
+func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, openaiMsgs []Message) error {
+	openaiTools := make([]openai.Tool, len(functions))
+	for i, f := range functions {
+		openaiTools[i] = openai.Tool{
+			Type:     "function",
+			Function: &f,
+		}
+	}
+	req := openai.ChatCompletionRequest{
+		Model:      "default",
+		Messages:   convertToOpenAIMessages(openaiMsgs),
+		Tools:      openaiTools,
+		ToolChoice: "auto",
+		Stream:     false,
+	}
+	wLogger.Debugf("WrapperWrite function_call req:%v, sid:%v\n", toString(req), inst.sid)
+	ctx := context.Background()
+	resp, err := inst.client.openaiClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		wLogger.Errorw("WrapperWrite function_call CreateChatCompletion error", "error", err, "sid", inst.sid)
+		responseError(inst, err)
+		return err
+	}
+	var toolCalls []openai.FunctionCall
+	if len(resp.Choices) > 0 && len(resp.Choices[0].Message.ToolCalls) > 0 {
+		for _, v := range resp.Choices[0].Message.ToolCalls {
+			toolCalls = append(toolCalls, openai.FunctionCall{
+				Name:      v.Function.Name,
+				Arguments: v.Function.Arguments,
+			})
+		}
+	}
+	// 整理结果
+	status := comwrapper.DataEnd
+	openaiContent := resp.Choices[0].Message.Content
+	if openaiContent == "" {
+		openaiContent = " "
+	}
+	content, err := responseContent(status, 0, openaiContent, "", toolCalls)
+	if err != nil {
+		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
+		responseError(inst, err)
+		return err
+	}
+
+	usage, err := responseUsage(status, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	if err != nil {
+		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
+		responseError(inst, err)
+		return err
+	}
+	if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{content, usage}, nil); err != nil {
+		wLogger.Errorw("WrapperWrite error function_calls callback failed", "error", err, "sid", inst.sid)
+		return err
+	}
+	return nil
 }
 
 // WrapperWrite 数据写入
@@ -476,7 +586,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"topP", topP)
 
 		promptTokensLen, resultTokensLen := 0, 0
-		openaiMsgs := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+		openaiMsgs, functions := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+
+		// 如果是fuction请求
+		if len(functions) > 0 {
+			return openaiFunctionCall(inst, functions, openaiMsgs)
+		}
+
 		thinking := false
 		if isReasoningModel {
 			lastMsg := openaiMsgs[len(openaiMsgs)-1]
@@ -505,6 +621,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
+			defer func() {
+				if r := recover(); r != nil {
+					wLogger.Errorw("WrapperWrite panic: ", "sid", inst.sid, "r", r)
+				}
+			}()
 			wLogger.Infow("WrapperWrite starting stream inference", "sid", inst.sid)
 
 			ctx, cancel := context.WithTimeout(context.Background(), streamContextTimeoutSeconds)
@@ -523,7 +644,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 			status = comwrapper.DataContinue
 			// 首帧返回空
-			firstFrameContent, err := responseContent(status, index, "", "")
+			firstFrameContent, err := responseContent(status, index, "", "", nil)
 			if err != nil {
 				wLogger.Errorw("WrapperWrite error fisrt callback", "error", err, "sid", inst.sid)
 				responseError(inst, err)
@@ -550,7 +671,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
 
 					response, err := stream.Recv()
-
 					if err != nil {
 						if err == io.EOF {
 							wLogger.Infow("WrapperWrite stream ended normally", "sid", inst.sid)
@@ -576,7 +696,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							reasoning_last_chunk := chunks[0]
 							answer_start_chunk := chunks[1]
 
-							reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk)
+							reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk, nil)
 							wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_last_chunk:%v, sid:%v\n", index, status, reasoning_last_chunk, inst.sid)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
@@ -591,7 +711,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							}
 							index += 1
 
-							answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "")
+							answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "", nil)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite answer_start_chunk error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
@@ -608,14 +728,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						}
 
 						if thinking {
-							content, err = responseContent(status, index, "", chunk_content)
+							content, err = responseContent(status, index, "", chunk_content, nil)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite thinking content error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
 								return
 							}
 						} else {
-							content, err = responseContent(status, index, chunk_content, "")
+							content, err = responseContent(status, index, chunk_content, "", nil)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
@@ -717,6 +837,9 @@ func WrapperSetCtrl(fType comwrapper.CustomFuncType, f interface{}) (err error) 
 	case comwrapper.FuncMeter:
 		meterFunc = f.(func(usrTag string, key string, count int) (code int))
 		fmt.Println("WrapperSetCtrl meterFunc set successful.")
+	case comwrapper.FuncLbExtra:
+		LbExtraFunc = f.(func(params map[string]string) error)
+		fmt.Println("WrapperSetCtrl FuncLbExtra set successful.")
 	default:
 
 	}
@@ -732,49 +855,58 @@ func WrapperNotify(res comwrapper.WrapperData) (err error) {
 	return nil
 }
 
+func parseFunctions(funcStr string) []*openai.FunctionDefinition {
+	var functions []*openai.FunctionDefinition
+	if err := json.Unmarshal([]byte(funcStr), &functions); err != nil {
+		wLogger.Errorw("Invalid functions format", "functions", funcStr)
+	}
+	return functions
+}
+
 // parseMessages 解析消息
-func parseMessages(prompt string) []Message {
+func parseMessages(prompt string) ([]Message, []openai.FunctionDefinition) {
 	// 尝试解析JSON格式的消息
 	var messages []Message
 	if err := json.Unmarshal([]byte(prompt), &messages); err == nil {
 		// 检查消息格式是否正确
 		for _, msg := range messages {
 			if msg.Role == "" || msg.Content == nil {
-				wLogger.Errorw("Invalid message format", "message", msg)
+				wLogger.Errorw("parseMessages Invalid message format", "message", msg)
 				return []Message{{
 					Role:    "user",
 					Content: prompt,
-				}}
+				}}, nil
 			}
 		}
-		return messages
+		return messages, nil
 	}
-
+	wLogger.Debugw("parseMessages try sparkMsg")
 	// 如果不是JSON格式，尝试解析为Spark格式
 	var sparkMsg struct {
-		Messages []Message `json:"messages"`
+		Messages  []Message                   `json:"messages"`
+		Functions []openai.FunctionDefinition `json:"functions"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &sparkMsg); err == nil {
 		// 直接返回所有消息，包括tool消息
-		return sparkMsg.Messages
+		return sparkMsg.Messages, sparkMsg.Functions
 	}
 
 	// 如果都不是，则作为普通文本处理
-	wLogger.Debugw("Using plain text as message", "prompt", prompt)
+	wLogger.Debugw("parseMessages Using plain text as message", "prompt", prompt)
 	return []Message{{
 		Role:    "user",
 		Content: prompt,
-	}}
+	}}, nil
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
-	messages := parseMessages(prompt)
-	wLogger.Debugf("formatMessages messages: %v\n", messages)
+func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
+	messages, functions := parseMessages(prompt)
+	wLogger.Debugf("formatMessages messages: %v\n, functions:%v", toString(messages), toString(functions))
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
-		return messages
+		return messages, functions
 	}
 
 	// 查找最后一个tool消息
@@ -789,19 +921,19 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
-		return messages
+		return messages, functions
 	}
 
 	// 解析tool消息内容
 	var searchContent []map[string]interface{}
 	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
 		wLogger.Errorw("Failed to parse tool message content", "error", err)
-		return messages
+		return messages, functions
 	}
 
 	// 如果没有搜索内容，直接返回
 	if len(searchContent) == 0 {
-		return messages
+		return messages, functions
 	}
 
 	// 获取show_ref_label，默认为false
@@ -842,7 +974,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			tmpl, err := template.New("search").Parse(templateStr)
 			if err != nil {
 				wLogger.Errorw("Failed to parse template", "error", err)
-				return messages
+				return messages, functions
 			}
 
 			// 准备模板数据
@@ -860,7 +992,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			var result strings.Builder
 			if err := tmpl.Execute(&result, data); err != nil {
 				wLogger.Errorw("Failed to execute template", "error", err)
-				return messages
+				return messages, functions
 			}
 
 			messages[i].Content = result.String()
@@ -868,7 +1000,7 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 		}
 	}
 
-	return messages
+	return messages, functions
 }
 
 // OpenAIClient OpenAI客户端
