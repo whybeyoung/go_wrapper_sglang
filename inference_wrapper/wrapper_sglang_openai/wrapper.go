@@ -418,12 +418,10 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 
 func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token int) (comwrapper.WrapperData, error) {
 	result := map[string]interface{}{
-		"usage": map[string]interface{}{
-			"prompt_tokens":     prompt_token,
-			"completion_tokens": completion_token,
-			"total_tokens":      prompt_token + completion_token,
-			"question_tokens":   0,
-		},
+		"prompt_tokens":     prompt_token,
+		"completion_tokens": completion_token,
+		"total_tokens":      prompt_token + completion_token,
+		"question_tokens":   4, // 无意义，未使用默认值4
 	}
 	data, err := json.Marshal(result)
 
@@ -469,7 +467,31 @@ func toString(v any) string {
 	res, _ := json.Marshal(v)
 	return string(res)
 }
-func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, openaiMsgs []Message) error {
+
+// schemaMarshaler 自定义的 Marshaler 类型
+type schemaMarshaler struct {
+	data []byte
+}
+
+func (s schemaMarshaler) MarshalJSON() ([]byte, error) {
+	return s.data, nil
+}
+
+// 额外参数
+type ExtraParams struct {
+	ResponseFormat *struct {
+		Type       string `json:"type,omitempty"`
+		JSONSchema *struct {
+			Name        string                 `json:"name"`
+			Description string                 `json:"description,omitempty"`
+			Schema      map[string]interface{} `json:"schema"`
+			Strict      bool                   `json:"strict"`
+		} `json:"json_schema,omitempty"`
+	} `json:"response_format,omitempty"`
+	LogitBias map[string]int `json:"logit_bias,omitempty"`
+}
+
+func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, req *openai.ChatCompletionRequest) error {
 	openaiTools := make([]openai.Tool, len(functions))
 	for i, f := range functions {
 		openaiTools[i] = openai.Tool{
@@ -477,16 +499,19 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 			Function: &f,
 		}
 	}
-	req := openai.ChatCompletionRequest{
-		Model:      "default",
-		Messages:   convertToOpenAIMessages(openaiMsgs),
-		Tools:      openaiTools,
-		ToolChoice: "auto",
-		Stream:     false,
-	}
+	req.Tools = openaiTools
+	req.ToolChoice = "auto"
+	//req.Stream = false
+	// req := openai.ChatCompletionRequest{
+	// 	Model:      "default",
+	// 	Messages:   convertToOpenAIMessages(openaiMsgs),
+	// 	Tools:      openaiTools,
+	// 	ToolChoice: "auto",
+	// 	Stream:     false,
+	// }
 	wLogger.Debugf("WrapperWrite function_call req:%v, sid:%v\n", toString(req), inst.sid)
 	ctx := context.Background()
-	resp, err := inst.client.openaiClient.CreateChatCompletion(ctx, req)
+	resp, err := inst.client.openaiClient.CreateChatCompletion(ctx, *req)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite function_call CreateChatCompletion error", "error", err, "sid", inst.sid)
 		responseError(inst, err)
@@ -501,6 +526,7 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 			})
 		}
 	}
+	wLogger.Debugf("WrapperWrite function_call toolcalls:%v, sid:%v\n response:%v", toString(toolCalls), inst.sid, toString(resp))
 	// 整理结果
 	status := comwrapper.DataEnd
 	openaiContent := resp.Choices[0].Message.Content
@@ -578,7 +604,42 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				topP = t
 			}
 		}
-
+		streamReq := &openai.ChatCompletionRequest{
+			Model: "default",
+		}
+		// 从params中获取 extra_body
+		extra_parms := ""
+		if v, ok := inst.params["extra_body"]; ok {
+			extra_parms = v
+		}
+		// 解析 extra_parms
+		var extraParams ExtraParams
+		if err := json.Unmarshal([]byte(extra_parms), &extraParams); err != nil {
+			wLogger.Errorw("WrapperWrite unmarshal extra_parms error", "error", err, "sid", inst.sid, "extra_parms", extra_parms)
+		}
+		// 解析 extra_parms 的 response_format string 反序列化 ChatCompletionResponseFormat格式
+		var responseFormat openai.ChatCompletionResponseFormat
+		if extraParams.ResponseFormat != nil {
+			responseFormat.Type = openai.ChatCompletionResponseFormatType(extraParams.ResponseFormat.Type)
+			if extraParams.ResponseFormat.JSONSchema != nil {
+				// 将 schema 转换为 json.RawMessage
+				schemaBytes, err := json.Marshal(extraParams.ResponseFormat.JSONSchema.Schema)
+				if err != nil {
+					wLogger.Errorw("WrapperWrite marshal schema error", "error", err, "sid", inst.sid)
+				} else {
+					// 创建一个自定义的 Marshaler 类型
+					responseFormat.JSONSchema = &openai.ChatCompletionResponseFormatJSONSchema{
+						Name:        extraParams.ResponseFormat.JSONSchema.Name,
+						Description: extraParams.ResponseFormat.JSONSchema.Description,
+						Schema:      schemaMarshaler{data: schemaBytes},
+						Strict:      extraParams.ResponseFormat.JSONSchema.Strict,
+					}
+				}
+			}
+		}
+		if responseFormat.Type != "" {
+			streamReq.ResponseFormat = &responseFormat
+		}
 		wLogger.Infow("WrapperWrite request parameters",
 			"sid", inst.sid,
 			"temperature", temperature,
@@ -587,10 +648,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		promptTokensLen, resultTokensLen := 0, 0
 		openaiMsgs, functions := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
-
+		streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 		// 如果是fuction请求
 		if len(functions) > 0 {
-			return openaiFunctionCall(inst, functions, openaiMsgs)
+			return openaiFunctionCall(inst, functions, streamReq)
 		}
 
 		thinking := false
@@ -605,18 +666,25 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		// 创建流式请求
-		streamReq := &openai.ChatCompletionRequest{
-			Model:       "default",
-			Messages:    convertToOpenAIMessages(openaiMsgs),
-			Temperature: float32(temperature),
-			MaxTokens:   maxTokens,
-			Stream:      true,
-			StreamOptions: &openai.StreamOptions{
-				IncludeUsage: true,
-			},
-			TopP: float32(topP),
+		streamReq.Temperature = float32(temperature)
+		streamReq.MaxTokens = maxTokens
+		streamReq.Stream = true
+		streamReq.StreamOptions = &openai.StreamOptions{
+			IncludeUsage: true,
 		}
+		streamReq.TopP = float32(topP)
+		// 创建流式请求
+		// streamReq := &openai.ChatCompletionRequest{
+		// 	Model:       "default",
+		// 	Messages:    convertToOpenAIMessages(openaiMsgs),
+		// 	Temperature: float32(temperature),
+		// 	MaxTokens:   maxTokens,
+		// 	Stream:      true,
+		// 	StreamOptions: &openai.StreamOptions{
+		// 		IncludeUsage: true,
+		// 	},
+		// 	TopP: float32(topP),
+		// }
 		wLogger.Debugf("WrapperWrite streamReq:%v, %v\n", toString(streamReq), inst.sid)
 
 		// 使用协程处理流式请求
@@ -642,7 +710,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			index := 0
 			fullContent := ""
 
-			status = comwrapper.DataContinue
+			status = comwrapper.DataBegin
 			// 首帧返回空
 			firstFrameContent, err := responseContent(status, index, "", "", nil)
 			if err != nil {
@@ -656,7 +724,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			index += 1
-
+			status = comwrapper.DataContinue
 			for {
 				select {
 				case <-ctx.Done():
