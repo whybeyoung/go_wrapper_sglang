@@ -875,7 +875,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"maxTokens", maxTokens)
 
 		// 创建流式请求
-		messages := convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex))
+		formatResult := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+		messages := convertToOpenAIMessages(formatResult.Messages)
 
 		// thinking := false
 		// if os.Getenv("IS_REASONING_MODEL") == "true" {
@@ -1151,8 +1152,14 @@ func WrapperSetCtrl(fType comwrapper.CustomFuncType, f interface{}) (err error) 
 	return nil
 }
 
+// MessageParseResult 消息解析结果
+type MessageParseResult struct {
+	Messages  []Message  `json:"messages"`
+	Functions []Function `json:"functions,omitempty"`
+}
+
 // parseMessages 解析消息
-func parseMessages(prompt string) []Message {
+func parseMessages(prompt string) MessageParseResult {
 	// 尝试解析JSON格式的消息
 	var messages []Message
 	if err := json.Unmarshal([]byte(prompt), &messages); err == nil {
@@ -1160,39 +1167,56 @@ func parseMessages(prompt string) []Message {
 		for _, msg := range messages {
 			if msg.Role == "" || msg.Content == nil {
 				wLogger.Errorw("Invalid message format", "message", msg)
-				return []Message{{
-					Role:    "user",
-					Content: prompt,
-				}}
+				return MessageParseResult{
+					Messages: []Message{{
+						Role:    "user",
+						Content: prompt,
+					}},
+					Functions: []Function{},
+				}
 			}
 		}
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: []Function{},
+		}
 	}
 
 	// 如果不是JSON格式，尝试解析为Spark格式
 	var sparkMsg struct {
-		Messages []Message `json:"messages"`
+		Messages  []Message  `json:"messages"`
+		Functions []Function `json:"functions,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &sparkMsg); err == nil {
-		// 直接返回所有消息，包括tool消息
-		return sparkMsg.Messages
+		// 直接返回所有消息和函数，包括tool消息
+		return MessageParseResult{
+			Messages:  sparkMsg.Messages,
+			Functions: sparkMsg.Functions,
+		}
 	}
 
 	// 如果都不是，则作为普通文本处理
 	wLogger.Debugw("Using plain text as message", "prompt", prompt)
-	return []Message{{
-		Role:    "user",
-		Content: prompt,
-	}}
+	return MessageParseResult{
+		Messages: []Message{{
+			Role:    "user",
+			Content: prompt,
+		}},
+		Functions: []Function{},
+	}
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
-	messages := parseMessages(prompt)
+func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
+	parseResult := parseMessages(prompt)
+	messages := parseResult.Messages
 
-	// 如果没有搜索模板，直接返回解析后的消息
+	// 如果没有搜索模板，直接返回解析后的消息和函数
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 查找最后一个tool消息
@@ -1206,19 +1230,28 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 解析tool消息内容
 	var searchContent []map[string]interface{}
 	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
 		wLogger.Errorw("Failed to parse tool message content", "error", err)
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 如果没有搜索内容，直接返回
 	if len(searchContent) == 0 {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 获取show_ref_label，默认为false
@@ -1257,7 +1290,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			tmpl, err := template.New("search").Parse(templateStr)
 			if err != nil {
 				wLogger.Errorw("Failed to parse template", "error", err)
-				return messages
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
 			}
 
 			// 准备模板数据
@@ -1275,7 +1311,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			var result strings.Builder
 			if err := tmpl.Execute(&result, data); err != nil {
 				wLogger.Errorw("Failed to execute template", "error", err)
-				return messages
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
 			}
 
 			messages[i].Content = result.String()
@@ -1283,7 +1322,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 		}
 	}
 
-	return messages
+	return MessageParseResult{
+		Messages:  messages,
+		Functions: parseResult.Functions,
+	}
 }
 
 func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
@@ -1399,143 +1441,4 @@ type ChatCompletionRequest struct {
 	Tools       []Tool    `json:"tools,omitempty"`
 	ToolChoice  string    `json:"tool_choice,omitempty"`
 	// PD相关参数
-	BootstrapHost string `json:"bootstrap_host,omitempty"`
-	BootstrapPort int    `json:"bootstrap_port,omitempty"`
-	BootstrapRoom int64  `json:"bootstrap_room,omitempty"`
-	PrefillAddr   string `json:"prefill_addr,omitempty"`
-}
-
-// Message 消息结构
-type Message struct {
-	Role         string      `json:"role"`
-	Content      interface{} `json:"content"`
-	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
-}
-
-// Tool 工具结构
-type Tool struct {
-	Type     string   `json:"type"`
-	Function Function `json:"function"`
-}
-
-// Function 函数结构
-type Function struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"`
-}
-
-// ChatCompletionResponse 聊天完成响应
-type ChatCompletionResponse struct {
-	ID      string   `json:"id"`
-	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage"`
-}
-
-// Choice 选择结构
-type Choice struct {
-	Index   int     `json:"index"`
-	Message Message `json:"message"`
-}
-
-// Usage 使用量结构
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-// monitorSubprocess 监控子进程
-func monitorSubprocess(cmd *exec.Cmd) {
-	wLogger.Debugw("Starting Sglang process monitor...")
-
-	// 等待进程结束
-	err := cmd.Wait()
-	if err != nil {
-		// 获取退出码
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode := exitErr.ExitCode()
-			wLogger.Errorw("Sglang process exited with error",
-				"error", err,
-				"exit_code", exitCode)
-			// 根据退出码进行相应处理
-			switch exitCode {
-			case 0:
-				wLogger.Infow("Sglang process exited normally")
-			case 1:
-				wLogger.Errorw("Sglang process failed with general error")
-			case 2:
-				wLogger.Errorw("Sglang process failed with configuration error")
-			default:
-				wLogger.Errorw("Sglang process failed with unknown error code")
-			}
-		} else {
-			wLogger.Errorw("Sglang process failed to start or was terminated", "error", err)
-		}
-		// 子进程退出，主进程也退出
-		wLogger.Errorw("Sglang process exited, exiting main process")
-		os.Exit(1)
-	} else {
-		wLogger.Debugw("Sglang process exited normally")
-		// 子进程正常退出，主进程也退出
-		wLogger.Infow("Sglang process exited normally, exiting main process")
-		os.Exit(0)
-	}
-}
-
-// convertToOpenAIMessages 将自定义Message类型转换为OpenAI的ChatCompletionMessage类型
-func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage {
-	openAIMessages := make([]openai.ChatCompletionMessage, len(messages))
-	for i, msg := range messages {
-		content := ""
-		if msg.Content != nil {
-			switch v := msg.Content.(type) {
-			case string:
-				content = v
-			default:
-				// 如果不是字符串，尝试转换为JSON字符串
-				if jsonBytes, err := json.Marshal(v); err == nil {
-					content = string(jsonBytes)
-				}
-			}
-		}
-		openAIMessages[i] = openai.ChatCompletionMessage{
-			Role:    msg.Role,
-			Content: content,
-		}
-	}
-	return openAIMessages
-}
-
-// GetRequestState 安全地获取请求状态
-func (tm *TokenizerManager) GetRequestState(rid string) (*ReqState, bool) {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	state, exists := tm.RIDToState[rid]
-	return state, exists
-}
-
-// DeleteState 安全地删除请求状态
-func (tm *TokenizerManager) DeleteState(rid string) {
-	if tm == nil {
-		return
-	}
-	tm.mu.Lock()
-	delete(tm.RIDToState, rid)
-	tm.mu.Unlock()
-}
-
-// IsDecodeMode 判断是否为 decode 模式
-func (tm *TokenizerManager) IsDecodeMode() bool {
-	return tm.pdRole == "decode"
-}
-
-// IsPrefillMode 判断是否为 prefill 模式
-func (tm *TokenizerManager) IsPrefillMode() bool {
-	return tm.pdRole == "prefill"
-}
-
-// GetPDRole 获取当前 PD role
-func (tm *TokenizerManager) GetPDRole() string {
-	return tm.pdRole
-}
+	BootstrapHost string `

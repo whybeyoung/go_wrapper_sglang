@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -40,11 +41,15 @@ var (
 	sessionManager              *SessionManager
 	requestManager              *RequestManager
 	httpServerPort              int
+	metricsAutoReport           bool               // 添加全局变量存储是否自动上报指标
 	isDecodeMode                bool               // 添加全局变量存储PD模式
 	promptSearchTemplate        string             // 添加全局变量存储搜索模板
 	promptSearchTemplateNoIndex string             // 添加全局变量存储不带索引的搜索模板
 	dataChanBufferSize          = 1024 * 64        // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
 	timeDDL                     = 60 * time.Minute // 超时时间
+	traceFunc                   func(usrTag string, key string, value string) (code int)
+	meterFunc                   func(usrTag string, key string, count int) (code int)
+	LbExtraFunc                 func(params map[string]string) error
 )
 
 // RequestManager 请求管理器
@@ -115,6 +120,30 @@ type wrapperInst struct {
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
 	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
 	thinkingMode        bool       // 添加标志位记录 thinking 模式
+	functionCallMode    bool       // 添加标志位记录 function call 模式
+}
+
+// schemaMarshaler 自定义的 Marshaler 类型
+type schemaMarshaler struct {
+	data []byte
+}
+
+func (s schemaMarshaler) MarshalJSON() ([]byte, error) {
+	return s.data, nil
+}
+
+// 额外参数
+type ExtraParams struct {
+	ResponseFormat *struct {
+		Type       string `json:"type,omitempty"`
+		JSONSchema *struct {
+			Name        string                 `json:"name"`
+			Description string                 `json:"description,omitempty"`
+			Schema      map[string]interface{} `json:"schema"`
+			Strict      bool                   `json:"strict"`
+		} `json:"json_schema,omitempty"`
+	} `json:"response_format,omitempty"`
+	LogitBias map[string]int `json:"logit_bias,omitempty"`
 }
 
 // todo move to single file
@@ -140,6 +169,63 @@ type BatchStrOut struct {
 	// OutputTokenIdsLogprobsVal [][]interface{}          `msgpack:"output_token_ids_logprobs_val"`
 	// OutputTokenIdsLogprobsIdx [][]interface{}          `msgpack:"output_token_ids_logprobs_idx"`
 	// OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
+}
+
+// metrics for lb
+type ContentItem struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type Metric struct {
+	Name    string        `json:"name"`
+	Type    string        `json:"type"`
+	Content []ContentItem `json:"content"`
+}
+
+func ParseMetrics(text string) map[string]*Metric {
+	lines := strings.Split(text, "\n")
+	metrics := make(map[string]*Metric, len(lines))
+	var currentMetric *Metric
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "# HELP"):
+			continue
+
+		case strings.HasPrefix(line, "# TYPE"):
+			parts := strings.Fields(line)
+			if len(parts) < 4 {
+				continue
+			}
+
+			currentMetric = &Metric{
+				Name:    parts[2],
+				Type:    parts[3],
+				Content: []ContentItem{},
+			}
+			metrics[parts[2]] = currentMetric
+
+		default:
+			if currentMetric == nil {
+				continue
+			}
+			keyValue := strings.SplitN(line, " ", 2)
+			if len(keyValue) == 2 {
+				currentMetric.Content = append(currentMetric.Content, ContentItem{
+					Key:   keyValue[0],
+					Value: keyValue[1],
+				})
+			}
+		}
+	}
+
+	return metrics
 }
 
 // SessionManager 管理分词器和ZMQ通信
@@ -329,6 +415,42 @@ func (sm *SessionManager) receiveLoop() {
 	}
 }
 
+func reportSglangMetrics(serverMetricURL string) {
+	wLogger.Debugw("sglang metric start")
+	httpClient := http.Client{
+		Timeout: time.Second,
+	}
+	sleepInterval := 10 * time.Second
+	for {
+
+		resp, err := httpClient.Get(serverMetricURL)
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+			time.Sleep(sleepInterval)
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+			time.Sleep(sleepInterval)
+			continue
+		}
+		wLogger.Debugw("sglang metric", "resp", string(body))
+		sglangMetrics := ParseMetrics(string(body))
+		res := make(map[string]string, len(sglangMetrics))
+		for k, v := range sglangMetrics {
+			str, _ := json.Marshal(v)
+			res[k] = string(str)
+		}
+		err = LbExtraFunc(res)
+		if err != nil {
+			wLogger.Errorw("sglang metric", "err", err.Error())
+		}
+		time.Sleep(sleepInterval)
+	}
+}
+
 // Start 启动ZMQ接收器
 func (sm *SessionManager) Start() error {
 	socket, err := sm.zmqContext.NewSocket(zmq.PULL)
@@ -487,6 +609,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	enableMetrics := os.Getenv("ENABLE_METRICS")
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
+		metricsAutoReport = true
 		wLogger.Infow("Metrics enabled")
 	}
 
@@ -573,6 +696,12 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 启动监控协程
 	go monitorSubprocess(cmd)
+
+	// 启动 metrics 上报
+	// sglang指标上报
+	if metricsAutoReport {
+		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort))
+	}
 
 	// 等待服务就绪
 	if err := waitServerReady(fmt.Sprintf("http://localhost:%d/health", httpServerPort)); err != nil {
@@ -751,7 +880,7 @@ func (inst *wrapperInst) handleRidResponse() {
 					},
 					"question_type": "",
 				}
-			} else {
+			} else if !inst.functionCallMode {
 				chunkResponse = map[string]interface{}{
 					"choices": []map[string]interface{}{
 						{
@@ -759,6 +888,22 @@ func (inst *wrapperInst) handleRidResponse() {
 							"reasoning_content": "",
 							"index":             0,
 							"role":              "assistant",
+						},
+					},
+					"question_type": "",
+				}
+			} else {
+				// 这里需要 tool call parser 流式解析结果
+				// 需要重写python这块的 toolcall parser 流式解析结果
+				// todo
+				chunkResponse = map[string]interface{}{
+					"choices": []map[string]interface{}{
+						{
+							"content":           nil,
+							"reasoning_content": "",
+							"index":             0,
+							"role":              "assistant",
+							"function_call":     singleOut.OutputStr,
 						},
 					},
 					"question_type": "",
@@ -986,13 +1131,46 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
+		// 从params中获取 extra_body
+		extra_parms := ""
+		if v, ok := inst.params["extra_body"]; ok {
+			extra_parms = v
+		}
+		// 解析 extra_parms
+		var extraParams ExtraParams
+		if err := json.Unmarshal([]byte(extra_parms), &extraParams); err != nil {
+			wLogger.Errorw("WrapperWrite unmarshal extra_parms error", "error", err, "sid", inst.sid, "extra_parms", extra_parms)
+		}
+		// 解析 extra_parms 的 response_format string 反序列化 ChatCompletionResponseFormat格式
+		var responseFormat openai.ChatCompletionResponseFormat
+		if extraParams.ResponseFormat != nil {
+			responseFormat.Type = openai.ChatCompletionResponseFormatType(extraParams.ResponseFormat.Type)
+			if extraParams.ResponseFormat.JSONSchema != nil {
+				// 将 schema 转换为 json.RawMessage
+				schemaBytes, err := json.Marshal(extraParams.ResponseFormat.JSONSchema.Schema)
+				if err != nil {
+					wLogger.Errorw("WrapperWrite marshal schema error", "error", err, "sid", inst.sid)
+				} else {
+					// 创建一个自定义的 Marshaler 类型
+					responseFormat.JSONSchema = &openai.ChatCompletionResponseFormatJSONSchema{
+						Name:        extraParams.ResponseFormat.JSONSchema.Name,
+						Description: extraParams.ResponseFormat.JSONSchema.Description,
+						Schema:      schemaMarshaler{data: schemaBytes},
+						Strict:      extraParams.ResponseFormat.JSONSchema.Strict,
+					}
+				}
+			}
+		}
+
 		wLogger.Infow("WrapperWrite request parameters",
 			"sid", inst.sid,
 			"temperature", temperature,
 			"maxTokens", maxTokens)
 
 		// 创建流式请求
-		messages := convertToOpenAIMessages(formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex))
+		formatResult := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+		messages := convertToOpenAIMessages(formatResult.Messages)
+		functions := formatResult.Functions
 
 		if os.Getenv("IS_REASONING_MODEL") == "true" {
 			if len(messages) > 0 {
@@ -1036,6 +1214,27 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				},
 			},
 		}
+
+		if len(functions) > 0 {
+			wLogger.Debugw("WrapperWrite functions", "functions", functions)
+			inst.functionCallMode = true
+
+			// 将 functions 转换为 openai.Tool
+			tools := make([]openai.Tool, len(functions))
+			for i, function := range functions {
+				tools[i] = openai.Tool{
+					Type:     "function",
+					Function: function,
+				}
+			}
+			streamReq.Tools = tools
+			streamReq.ToolChoice = "auto"
+		}
+
+		if responseFormat.Type != "" {
+			streamReq.ResponseFormat = &responseFormat
+		}
+
 		if enableThinking {
 			streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
 				"enable_thinking": enableThinking,
@@ -1154,11 +1353,30 @@ func WrapperDebugInfo(hdl interface{}) (debug string) {
 
 // WrapperSetCtrl 设置控制函数
 func WrapperSetCtrl(fType comwrapper.CustomFuncType, f interface{}) (err error) {
-	return nil
+	switch fType {
+	case comwrapper.FuncTraceLog:
+		traceFunc = f.(func(usrTag string, key string, value string) (code int))
+		fmt.Println("WrapperSetCtrl traceLogFunc set successful.")
+	case comwrapper.FuncMeter:
+		meterFunc = f.(func(usrTag string, key string, count int) (code int))
+		fmt.Println("WrapperSetCtrl meterFunc set successful.")
+	case comwrapper.FuncLbExtra:
+		LbExtraFunc = f.(func(params map[string]string) error)
+		fmt.Println("WrapperSetCtrl FuncLbExtra set successful.")
+	default:
+
+	}
+	return
+}
+
+// MessageParseResult 消息解析结果
+type MessageParseResult struct {
+	Messages  []Message                    `json:"messages"`
+	Functions []*openai.FunctionDefinition `json:"functions,omitempty"`
 }
 
 // parseMessages 解析消息
-func parseMessages(prompt string) []Message {
+func parseMessages(prompt string) MessageParseResult {
 	// 尝试解析JSON格式的消息
 	var messages []Message
 	if err := json.Unmarshal([]byte(prompt), &messages); err == nil {
@@ -1166,39 +1384,56 @@ func parseMessages(prompt string) []Message {
 		for _, msg := range messages {
 			if msg.Role == "" || msg.Content == nil {
 				wLogger.Errorw("Invalid message format", "message", msg)
-				return []Message{{
-					Role:    "user",
-					Content: prompt,
-				}}
+				return MessageParseResult{
+					Messages: []Message{{
+						Role:    "user",
+						Content: prompt,
+					}},
+					Functions: []*openai.FunctionDefinition{},
+				}
 			}
 		}
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: []*openai.FunctionDefinition{},
+		}
 	}
 
 	// 如果不是JSON格式，尝试解析为Spark格式
 	var sparkMsg struct {
-		Messages []Message `json:"messages"`
+		Messages  []Message                    `json:"messages"`
+		Functions []*openai.FunctionDefinition `json:"functions,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &sparkMsg); err == nil {
-		// 直接返回所有消息，包括tool消息
-		return sparkMsg.Messages
+		// 直接返回所有消息和函数，包括tool消息
+		return MessageParseResult{
+			Messages:  sparkMsg.Messages,
+			Functions: sparkMsg.Functions,
+		}
 	}
 
 	// 如果都不是，则作为普通文本处理
 	wLogger.Debugw("Using plain text as message", "prompt", prompt)
-	return []Message{{
-		Role:    "user",
-		Content: prompt,
-	}}
+	return MessageParseResult{
+		Messages: []Message{{
+			Role:    "user",
+			Content: prompt,
+		}},
+		Functions: []*openai.FunctionDefinition{},
+	}
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) []Message {
-	messages := parseMessages(prompt)
+func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
+	parseResult := parseMessages(prompt)
+	messages := parseResult.Messages
 
-	// 如果没有搜索模板，直接返回解析后的消息
+	// 如果没有搜索模板，直接返回解析后的消息和函数
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 查找最后一个tool消息
@@ -1212,19 +1447,28 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 解析tool消息内容
 	var searchContent []map[string]interface{}
 	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
 		wLogger.Errorw("Failed to parse tool message content", "error", err)
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 如果没有搜索内容，直接返回
 	if len(searchContent) == 0 {
-		return messages
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
 	}
 
 	// 获取show_ref_label，默认为false
@@ -1263,7 +1507,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			tmpl, err := template.New("search").Parse(templateStr)
 			if err != nil {
 				wLogger.Errorw("Failed to parse template", "error", err)
-				return messages
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
 			}
 
 			// 准备模板数据
@@ -1281,7 +1528,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 			var result strings.Builder
 			if err := tmpl.Execute(&result, data); err != nil {
 				wLogger.Errorw("Failed to execute template", "error", err)
-				return messages
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
 			}
 
 			messages[i].Content = result.String()
@@ -1289,7 +1539,10 @@ func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemp
 		}
 	}
 
-	return messages
+	return MessageParseResult{
+		Messages:  messages,
+		Functions: parseResult.Functions,
+	}
 }
 
 func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
@@ -1391,13 +1644,13 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 
 // ChatCompletionRequest 聊天完成请求
 type ChatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
+	Model       string        `json:"model"`
+	Messages    []Message     `json:"messages"`
+	Temperature float64       `json:"temperature,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
+	Tools       []openai.Tool `json:"tools,omitempty"`
+	ToolChoice  string        `json:"tool_choice,omitempty"`
 	// PD相关参数
 	BootstrapHost string `json:"bootstrap_host,omitempty"`
 	BootstrapPort int    `json:"bootstrap_port,omitempty"`
