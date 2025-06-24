@@ -604,8 +604,24 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				topP = t
 			}
 		}
+
 		streamReq := &openai.ChatCompletionRequest{
 			Model: "default",
+		}
+
+		streamReq.ExtraBody = map[string]any{
+			"chat_template_kwargs": map[string]interface{}{
+				"enable_thinking": false,
+			},
+		}
+		if enable_thinking, ok := inst.params["enable_thinking"]; ok {
+			if enable_thinking == "true" {
+				streamReq.ExtraBody = map[string]any{
+					"chat_template_kwargs": map[string]interface{}{
+						"enable_thinking": true,
+					},
+				}
+			}
 		}
 		// 从params中获取 extra_body
 		extra_parms := ""
@@ -710,7 +726,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			index := 0
 			fullContent := ""
 
-			status = comwrapper.DataBegin
+			status = comwrapper.DataContinue
 			// 首帧返回空
 			firstFrameContent, err := responseContent(status, index, "", "", nil)
 			if err != nil {
@@ -724,7 +740,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			index += 1
-			status = comwrapper.DataContinue
+			//status = comwrapper.DataContinue
 			for {
 				select {
 				case <-ctx.Done():
@@ -970,7 +986,7 @@ func parseMessages(prompt string) ([]Message, []openai.FunctionDefinition) {
 // formatMessages 格式化消息，支持搜索模板
 func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
 	messages, functions := parseMessages(prompt)
-	wLogger.Debugf("formatMessages messages: %v\n, functions:%v", toString(messages), toString(functions))
+	wLogger.Debugf("formatMessages messages: %v\n, functions:%v", messages, functions)
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
