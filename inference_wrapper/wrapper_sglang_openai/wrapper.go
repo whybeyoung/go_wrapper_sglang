@@ -81,6 +81,18 @@ func NewRequestManager(client *OpenAIClient) *RequestManager {
 		Logger: logger,
 	}
 }
+func getFreePort() (int, error) {
+	// 监听一个系统分配端口（0 表示让系统自动选择）
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+
+	// 获取监听的实际地址
+	addr := listener.Addr().(*net.TCPAddr)
+	return addr.Port, nil
+}
 
 // WrapperInit 插件初始化, 全局只调用一次. 本地调试时, cfg参数由aiges.toml提供
 func WrapperInit(cfg map[string]string) (err error) {
@@ -157,6 +169,12 @@ func WrapperInit(cfg map[string]string) (err error) {
 	port := os.Getenv("HTTP_SERVER_PORT")
 	if port != "" {
 		httpServerPort, _ = strconv.Atoi(port)
+		if httpServerPort == 0 {
+			httpServerPort, err = getFreePort()
+			if err != nil {
+				return fmt.Errorf("getFreePort:%v", err)
+			}
+		}
 	}
 
 	// 获取额外参数
@@ -360,6 +378,7 @@ type wrapperInst struct {
 	callback   comwrapper.CallBackPtr
 	params     map[string]string
 	active     bool
+	// errorCh    chan error
 }
 
 // WrapperCreate 插件会话实例创建
@@ -381,6 +400,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		callback:   cb,
 		params:     params,
 		active:     true, // 初始化active为true
+		// errorCh:    make(chan error),
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -437,9 +457,12 @@ func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token 
 
 func responseError(inst *wrapperInst, err error) {
 	wLogger.Debugf("WrapperWrite stream err:%v, sid:%v\n", err.Error(), inst.sid)
-	if err := inst.callback(inst.usrTag, nil, err); err != nil {
+	errContent, _ := responseContent(comwrapper.DataBegin, 0, "", "", nil)
+
+	if err1 := inst.callback(inst.usrTag, []comwrapper.WrapperData{errContent}, err); err1 != nil {
 		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 	}
+	// inst.errorCh <- err
 }
 
 func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_len int) error {
@@ -856,6 +879,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			inst.stopQ <- true
 
 		}(streamReq, v.Status)
+		// select {
+		// case err := <-inst.errorCh:
+		// 	return err
+		// case <-time.After(1 * time.Second):
+		// 	return nil
+		// }
+
 	}
 
 	return nil
