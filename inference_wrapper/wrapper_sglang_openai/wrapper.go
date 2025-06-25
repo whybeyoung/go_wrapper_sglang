@@ -94,6 +94,16 @@ func getFreePort() (int, error) {
 	return addr.Port, nil
 }
 
+func writePortToFile(port int) error {
+	file, err := os.Create("/home/aiges/sglangport")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = fmt.Fprintf(file, "%d", httpServerPort)
+	return err
+}
+
 // WrapperInit 插件初始化, 全局只调用一次. 本地调试时, cfg参数由aiges.toml提供
 func WrapperInit(cfg map[string]string) (err error) {
 	fmt.Printf("---- wrapper init ----\n")
@@ -175,6 +185,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 				return fmt.Errorf("getFreePort:%v", err)
 			}
 		}
+	}
+
+	err = writePortToFile(httpServerPort)
+	if err != nil {
+		return fmt.Errorf("cant write port to file:%v", err)
 	}
 
 	// 获取额外参数

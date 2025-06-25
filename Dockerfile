@@ -12,6 +12,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libnl-3-dev \
         libnl-route-3-dev && \
+    apt-get install -y curl && \
     /usr/local/bin/python -m pip install --upgrade pip && \
     pip install sgl-kernel==0.1.0 && \
     pip install  --upgrade mooncake_transfer_engine==0.3.0b6 pyverbs prometheus-client && \
@@ -24,6 +25,8 @@ RUN apt-get update && \
 #ADD sglang/fz_sglang /usr/local/src/sglang
 ADD /aiservice_2.9.11.5.bin /home/aiges/
 COPY /aiservice_2.9.11.5.bin/lib /home/aiges/library
+ADD /scripts/health_check.sh /home/aiges/
+RUN chmod +x /home/aiges/health_check.sh
 WORKDIR /home/aiges
 COPY --from=builder /home/AIGES/bin/libwrapper.so /home/aiges
 COPY --from=builder /home/AIGES/bin/AIservice /home/aiges
