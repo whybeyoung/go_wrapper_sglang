@@ -120,6 +120,7 @@ type wrapperInst struct {
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
 	SingleOutChanClosed bool       // 添加标志位记录 channel 状态
 	thinkingMode        bool       // 添加标志位记录 thinking 模式
+	jsonMode            bool       // 添加标志位记录 json 模式
 	functionCallMode    bool       // 添加标志位记录 function call 模式
 }
 
@@ -867,7 +868,7 @@ func (inst *wrapperInst) handleRidResponse() {
 				inst.thinkingMode = true
 				singleOut.OutputStr = ""
 			}
-			if inst.thinkingMode {
+			if inst.thinkingMode && !inst.jsonMode {
 				// 构建增量响应结构
 				chunkResponse = map[string]interface{}{
 					"choices": []map[string]interface{}{
@@ -1145,6 +1146,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		var responseFormat openai.ChatCompletionResponseFormat
 		if extraParams.ResponseFormat != nil {
 			responseFormat.Type = openai.ChatCompletionResponseFormatType(extraParams.ResponseFormat.Type)
+			if responseFormat.Type == "json_schema" || responseFormat.Type == "json_object" {
+				inst.jsonMode = true
+			}
+
 			if extraParams.ResponseFormat.JSONSchema != nil {
 				// 将 schema 转换为 json.RawMessage
 				schemaBytes, err := json.Marshal(extraParams.ResponseFormat.JSONSchema.Schema)
