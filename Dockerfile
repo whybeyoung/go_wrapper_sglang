@@ -25,8 +25,9 @@ RUN apt-get update && \
 #ADD sglang/fz_sglang /usr/local/src/sglang
 ADD /aiservice_2.9.11.5.bin /home/aiges/
 COPY /aiservice_2.9.11.5.bin/lib /home/aiges/library
-ADD /scripts/health_check.sh /home/aiges/
-RUN chmod +x /home/aiges/health_check.sh
+ADD /scripts/. /home/aiges/
+RUN chmod +x /home/aiges/health_check.sh && \
+    chmod +x /home/aiges/warmup.py
 WORKDIR /home/aiges
 COPY --from=builder /home/AIGES/bin/libwrapper.so /home/aiges
 COPY --from=builder /home/AIGES/bin/AIservice /home/aiges

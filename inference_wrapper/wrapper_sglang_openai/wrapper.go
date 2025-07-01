@@ -393,7 +393,6 @@ type wrapperInst struct {
 	callback   comwrapper.CallBackPtr
 	params     map[string]string
 	active     bool
-	// errorCh    chan error
 }
 
 // WrapperCreate 插件会话实例创建
@@ -415,7 +414,6 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		callback:   cb,
 		params:     params,
 		active:     true, // 初始化active为true
-		// errorCh:    make(chan error),
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -472,12 +470,10 @@ func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token 
 
 func responseError(inst *wrapperInst, err error) {
 	wLogger.Debugf("WrapperWrite stream err:%v, sid:%v\n", err.Error(), inst.sid)
-	errContent, _ := responseContent(comwrapper.DataBegin, 0, "", "", nil)
 
-	if err1 := inst.callback(inst.usrTag, []comwrapper.WrapperData{errContent}, err); err1 != nil {
+	if err = inst.callback(inst.usrTag, nil, err); err != nil {
 		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 	}
-	// inst.errorCh <- err
 }
 
 func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_len int) error {
@@ -894,12 +890,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			inst.stopQ <- true
 
 		}(streamReq, v.Status)
-		// select {
-		// case err := <-inst.errorCh:
-		// 	return err
-		// case <-time.After(1 * time.Second):
-		// 	return nil
-		// }
 
 	}
 

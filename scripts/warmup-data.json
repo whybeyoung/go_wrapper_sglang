@@ -1,0 +1,722 @@
+[
+    {
+      "prompt": "计算25 + 37",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算89 - 42",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算15 * 6",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算72 / 9",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算3的4次方",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算48和60的最大公约数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算18和24的最小公倍数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算144的平方根",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算e的自然对数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算sin(π/2)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算cos(π)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算tan(π/4)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "解释量子计算的基本原理",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "分析人工智能的应用场景",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "比较区块链和传统数据库的异同",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "讨论机器学习的未来发展趋势",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "列举深度学习的主要类型",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "说明自然语言处理的重要性",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "描述计算机视觉的工作流程",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "分析大数据的优缺点",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "解释云计算的数学模型",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "讨论物联网的伦理问题",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "将以下代码从Python转换为Java:\n\ndef fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "优化这段Python代码:\n\ndef is_prime(n):\n    if n < 2:\n        return False\n    for i in range(2, n):\n        if n % i == 0:\n            return False\n    return True",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "解释这段JavaScript代码的功能:\n\nfunction sum(a, b) {\n    return a + b;\n}\n\nconst result = sum(5, 3);\nconsole.log(result);",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "找出这段Java代码中的错误:\n\npublic class Main {\n    public static void main(String[] args) {\n        int x = 5;\n        System.out.println(\"x is: \" + x);\n    }",
+      "max_tokens": 100,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "为这段Python代码编写单元测试:\n\ndef add(a, b):\n    return a + b",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "实现一个快速排序算法",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "设计一个简单电商系统的架构",
+      "max_tokens": 300,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "解释单例设计模式",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "比较面向对象编程和函数式编程的范式",
+      "max_tokens": 250,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "讨论REST API的最佳实践",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "分析《哈姆雷特》中的哈姆雷特角色",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《1984》的主题和意义",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "比较《红楼梦》和《傲慢与偏见》的写作风格",
+      "max_tokens": 350,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "解释《老人与海》中的象征意义",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "分析莎士比亚的写作特点",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《活着》的历史背景",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "总结《三国演义》的主要情节",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "评价《西游记》的影响力",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "解释《战争与和平》中的哲学思考",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《呐喊》的争议点",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "将以下文本从中文翻译成英文:\n人工智能正在改变我们的生活和工作方式，从语音助手到自动驾驶汽车，AI技术的应用越来越广泛。",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下句子翻译成英文并解释语法:\n我已经等了他两个小时了。",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下段落翻译成英文并保持原意:\n随着科技的进步，我们的生活变得越来越便捷。互联网让我们可以随时随地获取信息，而移动支付则让购物变得更加简单。",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下诗歌翻译成英文并保留韵律:\n\n春眠不觉晓，\n处处闻啼鸟。\n夜来风雨声，\n花落知多少。",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下技术文档翻译成英文:\n\n本系统采用先进的深度学习算法，能够自动识别图像中的物体，并进行分类和标注。系统支持多种图像格式，处理速度快，准确率高。",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下对话翻译成英文并调整语气:\n\nA: 你能帮我一下吗？\nB: 当然可以，需要我做什么？",
+      "max_tokens": 100,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下广告文案翻译成英文:\n\n全新升级的智能手表，具备心率监测、睡眠分析和运动追踪功能。续航长达7天，防水深度达50米，是您健康生活的最佳伴侣。",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下法律条款翻译成英文:\n\n根据本合同条款，双方同意遵守以下规定: 1) 甲方应在合同签订后10个工作日内支付预付款; 2) 乙方应在收到预付款后30个工作日内交付货物; 3) 任何一方违反本合同条款，应承担相应的法律责任。",
+      "max_tokens": 300,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "什么是区块链技术？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "如何实现高效的时间管理？",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "为什么天空是蓝色的？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "何时应该使用递归算法？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "谁是阿尔伯特·爱因斯坦？",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "哪里可以找到高质量的开源项目？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "比较React和Vue.js框架",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "解释神经网络的工作原理",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "列出学习编程的三个主要优点",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "讨论气候变化的挑战和解决方案",
+      "max_tokens": 300,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "计算45 + 67",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算92 - 38",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算23 * 8",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算84 / 7",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算2的7次方",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算56和72的最大公约数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算15和25的最小公倍数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算225的平方根",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算10的自然对数",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算sin(π/4)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算cos(π/3)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "计算tan(π/6)",
+      "max_tokens": 50,
+      "temperature": 0.2,
+      "type": "math"
+    },
+    {
+      "prompt": "解释相对论的基本原理",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "分析进化论的证据",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "比较量子力学和经典力学的异同",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "讨论热力学第二定律的意义",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "列举电磁学的主要应用",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "说明光合作用的过程",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "描述DNA测序的方法",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "分析CRISPR技术的潜力",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "解释纳米技术的概念",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "讨论石墨烯的特性和应用",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "science"
+    },
+    {
+      "prompt": "将以下代码从Java转换为Python:\n\npublic class HelloWorld {\n    public static void main(String[] args) {\n        System.out.println(\"Hello, World!\");\n    }\n}",
+      "max_tokens": 100,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "优化这段JavaScript代码:\n\nfunction factorial(n) {\n    if (n === 0) {\n        return 1;\n    } else {\n        return n * factorial(n-1);\n    }\n}",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "解释这段Python代码的功能:\n\ndef is_palindrome(s):\n    return s == s[::-1]",
+      "max_tokens": 100,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "找出这段C++代码中的错误:\n\n#include <iostream>\n\nint main() {\n    std::cout << \"Hello, World!\";\n    return 0;\n}",
+      "max_tokens": 100,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "为这段JavaScript代码编写单元测试:\n\nfunction multiply(a, b) {\n    return a * b;\n}",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "实现一个二分查找算法",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "设计一个社交媒体平台的架构",
+      "max_tokens": 300,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "解释观察者设计模式",
+      "max_tokens": 150,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "比较关系型数据库和非关系型数据库",
+      "max_tokens": 250,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "讨论微服务架构的优缺点",
+      "max_tokens": 200,
+      "temperature": 0.6,
+      "type": "programming"
+    },
+    {
+      "prompt": "分析《简·爱》中的简·爱角色",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《呐喊》的主题和意义",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "比较《巴黎圣母院》和《悲惨世界》的写作风格",
+      "max_tokens": 350,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "解释《百年孤独》中的魔幻现实主义",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "分析托尔斯泰的写作特点",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《骆驼祥子》的社会意义",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "总结《水浒传》的主要情节",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "评价《聊斋志异》的文学价值",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "解释《飘》中的女性形象",
+      "max_tokens": 300,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "讨论《活着》中的生命意义",
+      "max_tokens": 250,
+      "temperature": 0.8,
+      "type": "literature"
+    },
+    {
+      "prompt": "将以下文本从英文翻译成中文:\nArtificial Intelligence is revolutionizing industries across the globe, from healthcare to finance, by automating complex tasks and providing insights that were previously unattainable.",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下句子翻译成中文并解释语法:\nShe has been working on this project for three months.",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下段落翻译成中文并保持原意:\nThe rapid development of technology has transformed the way we live and work. Smartphones have become an essential part of our daily lives, connecting us to information and people around the world.",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下诗歌翻译成中文并保留韵律:\n\nTwinkle, twinkle, little star,\nHow I wonder what you are!\nUp above the world so high,\nLike a diamond in the sky.",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下技术文档翻译成中文:\n\nThis software uses advanced machine learning algorithms to predict user behavior and provide personalized recommendations. It analyzes large amounts of data in real-time, ensuring high accuracy and efficiency.",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下对话翻译成中文并调整语气:\n\nA: Could you please pass the salt?\nB: Sure, here you are.",
+      "max_tokens": 100,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下广告文案翻译成中文:\n\nIntroducing our newest smartphone, featuring a 6.7-inch display, 5000mAh battery, and 108MP camera. With 5G connectivity and AI-powered photography, it's the perfect companion for your digital life.",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "将以下法律条款翻译成中文:\n\nUnder the terms of this agreement, the parties agree to the following: 1) Party A shall provide the necessary resources within 15 business days; 2) Party B shall complete the project within 60 business days; 3) Either party may terminate this agreement with 30 days' written notice.",
+      "max_tokens": 300,
+      "temperature": 0.7,
+      "type": "translation"
+    },
+    {
+      "prompt": "什么是自然语言处理？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "如何提高编程技能？",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "为什么需要数据结构和算法？",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "何时应该使用Docker容器？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "谁是斯蒂芬·霍金？",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "哪里可以学习数据科学？",
+      "max_tokens": 150,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "比较Python和Java编程语言",
+      "max_tokens": 250,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "解释云计算的三种服务模式",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "列出学习机器学习的主要资源",
+      "max_tokens": 200,
+      "temperature": 0.7,
+      "type": "qa"
+    },
+    {
+      "prompt": "讨论人工智能的伦理问题",
+      "max_tokens": 300,
+      "temperature": 0.7,
+      "type": "qa"
+    }
+  ]
