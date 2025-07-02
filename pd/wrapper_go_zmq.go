@@ -50,6 +50,12 @@ var (
 	traceFunc                   func(usrTag string, key string, value string) (code int)
 	meterFunc                   func(usrTag string, key string, count int) (code int)
 	LbExtraFunc                 func(params map[string]string) error
+	throughputMax               float64
+)
+
+const (
+	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
+	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
 )
 
 // RequestManager 请求管理器
@@ -174,8 +180,8 @@ type BatchStrOut struct {
 
 // metrics for lb
 type ContentItem struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Key   string  `json:"key"`
+	Value float64 `json:"value"`
 }
 
 type Metric struct {
@@ -218,9 +224,14 @@ func ParseMetrics(text string) map[string]*Metric {
 			}
 			keyValue := strings.SplitN(line, " ", 2)
 			if len(keyValue) == 2 {
+				val, err := strconv.ParseFloat(keyValue[1], 64)
+				if err != nil {
+					// 解析失败你可以选择跳过或赋0
+					val = 0
+				}
 				currentMetric.Content = append(currentMetric.Content, ContentItem{
 					Key:   keyValue[0],
-					Value: keyValue[1],
+					Value: val,
 				})
 			}
 		}
@@ -416,12 +427,25 @@ func (sm *SessionManager) receiveLoop() {
 	}
 }
 
-func reportSglangMetrics(serverMetricURL string) {
+func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 	wLogger.Debugw("sglang metric start")
 	httpClient := http.Client{
 		Timeout: time.Second,
 	}
+	var metricName, logstr string
+	if isDecodeMode {
+		metricName = "sglang:generation_tokens_total"
+		logstr = "decode throughput"
+	} else {
+		metricName = "sglang:prompt_tokens_total"
+		logstr = "prefill throughput"
+	}
 	sleepInterval := 10 * time.Second
+	lastReportTime := time.Now()
+	lastMetricValue := float64(0)
+	newMetricValue := float64(0)
+	throughput := float64(0)
+
 	for {
 
 		resp, err := httpClient.Get(serverMetricURL)
@@ -437,16 +461,28 @@ func reportSglangMetrics(serverMetricURL string) {
 			time.Sleep(sleepInterval)
 			continue
 		}
-		wLogger.Debugw("sglang metric", "resp", string(body))
+		//wLogger.Debugw("sglang metric", "resp", string(body))
 		sglangMetrics := ParseMetrics(string(body))
-		res := make(map[string]string, len(sglangMetrics))
-		for k, v := range sglangMetrics {
-			str, _ := json.Marshal(v)
-			res[k] = string(str)
-		}
-		err = LbExtraFunc(res)
-		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
+		if sglangMetrics != nil {
+			if metric, ok := sglangMetrics[metricName]; ok {
+				lastMetricValue = newMetricValue
+				newMetricValue = metric.Content[0].Value
+				delta := newMetricValue - lastMetricValue
+				deltaTime := time.Since(lastReportTime)
+				lastReportTime = time.Now()
+				throughput = float64(delta) / deltaTime.Seconds()
+				res := map[string]string{}
+				wrapperInfo := map[string]any{}
+				wrapperInfo["throughput"] = throughput
+				wrapperInfo["throughput_max"] = throughputMax
+				wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
+				res["wrapper_info"] = string(wrapperInfoBytes)
+				wLogger.Debugw(logstr, "throughput", wrapperInfo["throughput"], "throughput_max", wrapperInfo["throughput_max"])
+				err = LbExtraFunc(res)
+				if err != nil {
+					wLogger.Errorw("sglang metric", "err", err.Error())
+				}
+			}
 		}
 		time.Sleep(sleepInterval)
 	}
@@ -527,6 +563,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 获取不带索引的搜索模板
 	if v, ok := cfg["prompt_search_template_no_index"]; ok {
 		promptSearchTemplateNoIndex = v
+	}
+
+	// 获取指标上报地址
+	if v, ok := cfg["throughput_max"]; ok {
+		throughputMax, _ = strconv.ParseFloat(v, 64)
 	}
 
 	// 创建日志目录
@@ -701,7 +742,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 启动 metrics 上报
 	// sglang指标上报
 	if metricsAutoReport {
-		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort))
+		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort), isDecodeMode)
 	}
 
 	// 等待服务就绪
@@ -1246,9 +1287,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		// prefill 首桢已经check过， 且无错误
-		firstChunkResponseChecked := false
-
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
 			wLogger.Infow("WrapperWrite Upstream starting stream inference", "sid", inst.sid)
@@ -1287,17 +1325,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				default:
 					if _, err := inst.Stream.Recv(); err != nil {
 						wLogger.Debugw("Stream Recv error...", "error", err, "sid", inst.sid)
-						if !firstChunkResponseChecked {
-							// 第一帧就报错了，比如是 超长了
-							inst.active = false
-							if err := inst.callback(inst.usrTag, nil, err); err != nil {
-								wLogger.Errorw("Prefill error...", "error", err, "sid", inst.sid)
+						// 第一帧就报错了，比如是 超长了
+						inst.active = false
+						// 检查是否是token超限错误
+						if isTokenLimitExceededError(err) {
+							wLogger.Warnw("Token limit exceeded error detected", "error", err, "sid", inst.sid)
+							// 创建一个自定义的token超限错误
+							tokenLimitErr := errors.New(ENGINE_TOKEN_LIMIT_EXCEEDED_ERR)
+							if err := inst.callback(inst.usrTag, nil, tokenLimitErr); err != nil {
+								wLogger.Errorw("Token limit exceeded callback failed", "error", err, "sid", inst.sid)
 							}
+						} else {
+							wLogger.Errorw("Recv error...", "error", err, "sid", inst.sid)
 						}
-						return
-					} else {
-						firstChunkResponseChecked = true
 					}
+					return
 				}
 			}
 			// 实例已经不活跃了， 退出协程 清理 closeStgream
@@ -1306,6 +1348,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	}
 
 	return nil
+}
+
+// isTokenLimitExceededError 检查是否是token超限错误
+func isTokenLimitExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errorMsg := err.Error()
+	// 检查是否包含token超限的关键字
+	return strings.Contains(errorMsg, "Requested token count exceeds the model's maximum context length") ||
+		strings.Contains(errorMsg, "maximum context length") ||
+		strings.Contains(errorMsg, "is longer than the model's context length")
 }
 
 // WrapperDestroy 会话资源销毁
