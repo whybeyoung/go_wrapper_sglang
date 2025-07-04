@@ -434,7 +434,7 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 	}
 	var metricName, logstr string
 	if isDecodeMode {
-		metricName = "sglang:generation_tokens_total"
+		metricName = "sglang:gen_throughput"
 		logstr = "decode throughput"
 	} else {
 		metricName = "sglang:prompt_tokens_total"
@@ -445,7 +445,8 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 	lastMetricValue := float64(0)
 	newMetricValue := float64(0)
 	throughput := float64(0)
-
+	has_generation_tokens_total := false
+	generation_token_metric := "sglang:generation_tokens_total"
 	for {
 
 		resp, err := httpClient.Get(serverMetricURL)
@@ -463,6 +464,9 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 		}
 		//wLogger.Debugw("sglang metric", "resp", string(body))
 		sglangMetrics := ParseMetrics(string(body))
+		if has_generation_tokens_total {
+			metricName = generation_token_metric
+		}
 		if sglangMetrics != nil {
 			if metric, ok := sglangMetrics[metricName]; ok {
 				lastMetricValue = newMetricValue
@@ -470,7 +474,12 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 				delta := newMetricValue - lastMetricValue
 				deltaTime := time.Since(lastReportTime)
 				lastReportTime = time.Now()
-				throughput = float64(delta) / deltaTime.Seconds()
+				if isDecodeMode {
+					throughput = newMetricValue
+				} else {
+					throughput = float64(delta) / deltaTime.Seconds()
+				}
+
 				res := map[string]string{}
 				wrapperInfo := map[string]any{}
 				wrapperInfo["throughput"] = throughput
@@ -482,6 +491,8 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 				if err != nil {
 					wLogger.Errorw("sglang metric", "err", err.Error())
 				}
+			} else if _, ok = sglangMetrics[generation_token_metric]; ok && isDecodeMode {
+				has_generation_tokens_total = true
 			}
 		}
 		time.Sleep(sleepInterval)
