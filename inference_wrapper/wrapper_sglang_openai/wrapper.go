@@ -5,6 +5,7 @@ import (
 	"comwrapper"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -49,11 +50,13 @@ var meterFunc func(usrTag string, key string, count int) (code int)
 var LbExtraFunc func(params map[string]string) error
 
 const (
-	R1_THINK_START              = "<think>"
-	R1_THINK_END                = "</think>"
-	HTTP_SERVER_REQUEST_TIMEOUT = time.Second * 10
-	HTTP_SERVER_MAX_RETRY_TIME  = time.Minute * 30
-	STREAM_CONNECT_TIMEOUT      = "stream connect timeout"
+	R1_THINK_START                  = "<think>"
+	R1_THINK_END                    = "</think>"
+	HTTP_SERVER_REQUEST_TIMEOUT     = time.Second * 10
+	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 30
+	STREAM_CONNECT_TIMEOUT          = "stream connect timeout"
+	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
+	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
 )
 
 // RequestManager 请求管理器
@@ -794,8 +797,15 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							wLogger.Infow("WrapperWrite stream ended normally", "sid", inst.sid)
 							goto endLoop
 						}
+						// 检查是否是token超限错误
+						if isTokenLimitExceededError(err) {
+							wLogger.Warnw("Token limit exceeded error detected", "error", err, "sid", inst.sid)
+							// 创建一个自定义的token超限错误
+							err = errors.New(ENGINE_TOKEN_LIMIT_EXCEEDED_ERR)
+						} else {
+							wLogger.Errorw("WrapperWrite read stream error", "error", err, "sid", inst.sid)
+						}
 						responseError(inst, err)
-						wLogger.Errorw("WrapperWrite read stream error", "error", err, "sid", inst.sid)
 						return
 					}
 
@@ -894,6 +904,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	}
 
 	return nil
+}
+
+// isTokenLimitExceededError 检查是否是token超限错误
+func isTokenLimitExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errorMsg := err.Error()
+	// 检查是否包含token超限的关键字
+	return strings.Contains(errorMsg, "Requested token count exceeds the model's maximum context length") ||
+		strings.Contains(errorMsg, "maximum context length") ||
+		strings.Contains(errorMsg, "is longer than the model's context length")
 }
 
 // WrapperDestroy 会话资源销毁

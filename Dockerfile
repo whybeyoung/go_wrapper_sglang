@@ -1,4 +1,4 @@
-FROM artifacts.iflytek.com/docker-private/aipaas/aiges-build:2.9.11.6.debug as builder
+FROM artifacts.iflytek.com/docker-private/aipaas/aiges-build:2.9.13 as builder
 ADD inference_wrapper/wrapper_sglang_openai/wrapper.go /home/AIGES/src/wrapper/
 ADD  vendor/github.com/whybeyoung/go-openai /home/AIGES/src/github.com/whybeyoung/go-openai
 ADD /utils /home/AIGES/src/github.com/whybeyoung/go_wrapper_sglang/utils
