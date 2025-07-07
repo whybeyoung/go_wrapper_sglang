@@ -51,6 +51,7 @@ var (
 	meterFunc                   func(usrTag string, key string, count int) (code int)
 	LbExtraFunc                 func(params map[string]string) error
 	throughputMax               float64
+	isGoRecvTokenizer           bool = true // 是否是 Go Recv Tokenizer 模式
 )
 
 const (
@@ -116,6 +117,7 @@ type wrapperInst struct {
 	sid            string
 	client         *OpenAIClient
 	firstFrame     bool
+	firstChunkTime time.Time
 	callback       comwrapper.CallBackPtr
 	params         map[string]string
 	active         bool
@@ -344,45 +346,6 @@ func (sm *SessionManager) HandleBatchOutput(data []byte) error {
 			if idx < len(batchOut.SpecVerifyCt) {
 				singleOut.SpecVerifyCt = batchOut.SpecVerifyCt[idx]
 			}
-			// if idx < len(batchOut.InputTokenLogprobsVal) {
-			// 	singleOut.InputTokenLogprobsVal = batchOut.InputTokenLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.InputTokenLogprobsIdx) {
-			// 	singleOut.InputTokenLogprobsIdx = batchOut.InputTokenLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.OutputTokenLogprobsVal) {
-			// 	singleOut.OutputTokenLogprobsVal = batchOut.OutputTokenLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.OutputTokenLogprobsIdx) {
-			// 	singleOut.OutputTokenLogprobsIdx = batchOut.OutputTokenLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.InputTopLogprobsVal) {
-			// 	singleOut.InputTopLogprobsVal = batchOut.InputTopLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.InputTopLogprobsIdx) {
-			// 	singleOut.InputTopLogprobsIdx = batchOut.InputTopLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.OutputTopLogprobsVal) {
-			// 	singleOut.OutputTopLogprobsVal = batchOut.OutputTopLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.OutputTopLogprobsIdx) {
-			// 	singleOut.OutputTopLogprobsIdx = batchOut.OutputTopLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.InputTokenIdsLogprobsVal) {
-			// 	singleOut.InputTokenIdsLogprobsVal = batchOut.InputTokenIdsLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.InputTokenIdsLogprobsIdx) {
-			// 	singleOut.InputTokenIdsLogprobsIdx = batchOut.InputTokenIdsLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.OutputTokenIdsLogprobsVal) {
-			// 	singleOut.OutputTokenIdsLogprobsVal = batchOut.OutputTokenIdsLogprobsVal[idx]
-			// }
-			// if idx < len(batchOut.OutputTokenIdsLogprobsIdx) {
-			// 	singleOut.OutputTokenIdsLogprobsIdx = batchOut.OutputTokenIdsLogprobsIdx[idx]
-			// }
-			// if idx < len(batchOut.OutputHiddenStates) {
-			// 	singleOut.OutputHiddenStates = batchOut.OutputHiddenStates[idx]
-			// }
 
 			// 发送到实例的通道
 			if state.Inst.active {
@@ -500,7 +463,7 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 }
 
 // Start 启动ZMQ接收器
-func (sm *SessionManager) Start() error {
+func (sm *SessionManager) StartGoReceiver() error {
 	socket, err := sm.zmqContext.NewSocket(zmq.PULL)
 	if err != nil {
 		return fmt.Errorf("failed to create zmq socket: %v", err)
@@ -629,22 +592,30 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if zmqPort == "" {
 		zmqPort = "10110"
 	}
-
+	// 检查SGLang Tokenizer 模式
+	sglangTokenizerMode := os.Getenv("SGLANG_TOKENIZER_MODE")
+	if sglangTokenizerMode == "noraml" {
+		isGoRecvTokenizer = false
+	}
 	// 检查PD模式
 	pdType := os.Getenv("AIGES_PD_ROLE")
 
 	leaderAddr := os.Getenv("LWS_LEADER_ADDRESS")
 	if leaderAddr != "" {
-		fmt.Printf("Start ZMQReceiver on %s:%s\n", leaderAddr, zmqPort)
 		var err error
 		sessionManager, err = NewSessionManager(leaderAddr, zmqPort, pdType)
 		if err != nil {
-			return fmt.Errorf("failed to create tokenizer manager: %v", err)
+			return fmt.Errorf("failed to create NewSessionManager manager: %v", err)
+		}
+		if isGoRecvTokenizer {
+			fmt.Printf("Start ZMQReceiver on %s:%s\n", leaderAddr, zmqPort)
+			if err := sessionManager.StartGoReceiver(); err != nil {
+				return fmt.Errorf("failed to start tokenizer manager: %v", err)
+			}
+		} else {
+			fmt.Printf("Normal mode For SGLang Tokenizer Manager\n")
 		}
 
-		if err := sessionManager.Start(); err != nil {
-			return fmt.Errorf("failed to start tokenizer manager: %v", err)
-		}
 	}
 
 	httpServerPort, _ = strconv.Atoi(port)
@@ -788,6 +759,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		sid:            sid,
 		client:         requestManager.Client,
 		firstFrame:     true,
+		firstChunkTime: time.Now(),
 		callback:       cb,
 		params:         params,
 		active:         true,
@@ -873,6 +845,7 @@ func (inst *wrapperInst) handleRidResponse() {
 	var totalPromptTokens, totalCompletionTokens int
 	var chunkIndex int = 0
 	var finished bool = false
+	var ttft time.Duration
 
 	defer inst.closeHttpStream()
 
@@ -887,6 +860,7 @@ func (inst *wrapperInst) handleRidResponse() {
 				wLogger.Infow("SingleOutChan closed, exiting", "sid", inst.sid)
 				return
 			}
+			ttft = time.Since(inst.firstChunkTime)
 			if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
 				keepAliveData := comwrapper.WrapperData{
 					Key:      "__keepalive_down",
@@ -900,11 +874,14 @@ func (inst *wrapperInst) handleRidResponse() {
 				if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
 					wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
 				} else {
-					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid)
+					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft)
 				}
 				// preifll 第一帧就结束 并发送释放信号
 				inst.active = false
 				return
+			} else if chunkIndex == 0 && !inst.SessionManager.IsPrefillMode() {
+				// 非 prefill 模式 仅记录ttft
+				wLogger.Infow("Decode Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft)
 			}
 
 			// 累加 token 数量
@@ -1160,8 +1137,10 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		}
 	}
 
-	// 启动一个 goroutine 来处理 接收到的SingleOutChan 的数据
-	go inst.handleRidResponse()
+	if isGoRecvTokenizer {
+		// 启动一个 goroutine 来处理 接收到的SingleOutChan 的数据
+		go inst.handleRidResponse()
+	}
 
 	for _, v := range req {
 		if v.Key == "__kv_info" {
