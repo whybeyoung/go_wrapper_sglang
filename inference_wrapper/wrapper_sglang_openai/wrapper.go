@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"comwrapper"
@@ -26,9 +27,15 @@ import (
 	gwsUtils "github.com/whybeyoung/go_wrapper_sglang/utils"
 )
 
+type PatchRes struct {
+	InnerPatchId string
+	PatchId      string
+	LoraPath     string
+}
+
 var (
 	wLogger                     *utils.Logger
-	logLevel                    = "debug"
+	logLevel                    = "info"
 	logCount                    = 10
 	logSize                     = 30
 	logAsync                    = true
@@ -42,8 +49,18 @@ var (
 	topP                        = 0.95
 	promptSearchTemplate        string // 添加全局变量存储搜索模板
 	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
-	isReasoningModel            bool
-	cmd                         *exec.Cmd
+	finetuneType                = ""   // 添加全局变量存储finetune类型
+	// inferType                   string            // 添加全局变量存储推理类型
+	patchResMap            map[string]PatchRes     // 添加全局变量存储InnerPatchId id path map
+	patchIdInnerPatchIdMap map[string]string       // 添加全局变量存储patchId InnerPatchId map
+	patchIdMapMutex        sync.RWMutex            // 添加锁保护patchIdMap
+	pretrainedName         string                  // 添加全局变量存储pretrained name
+	server                 = "http://127.0.0.1:%d" // 添加全局变量存储server url
+	isReasoningModel       bool
+	cmd                    *exec.Cmd
+	globalEnableThinking   = true
+	loadLoraAdapter        = "load_lora_adapter"
+	unloadLoraAdapter      = "unload_lora_adapter"
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -54,12 +71,13 @@ const (
 	R1_THINK_START                  = "<think>"
 	R1_THINK_END                    = "</think>"
 	HTTP_SERVER_REQUEST_TIMEOUT     = time.Second * 10
-	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 30
+	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 60
 	STREAM_CONNECT_TIMEOUT          = "stream connect timeout"
 	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
 	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
 
 	DEFAULT_MODEL_NAME = "default"
+	LORA_WEIGHT_PATH   = "/home/lora_weight"
 )
 
 // RequestManager 请求管理器
@@ -220,30 +238,18 @@ func WrapperInit(cfg map[string]string) (err error) {
 		extraArgs += fmt.Sprintf(" --tool-call-parser %v ", toolCallParser)
 	}
 
-	// 检查多节点模式
-	enableMultiNode := os.Getenv("ENABLE_MULTI_NODE_MODE")
-	if enableMultiNode == "true" {
-		wLogger.Infow("Multi-node mode enabled")
-
-		// 获取组大小
-		if groupSize := os.Getenv("LWS_GROUP_SIZE"); groupSize != "" {
-			extraArgs += fmt.Sprintf(" --nnodes %s", groupSize)
+	pretrainedName = os.Getenv("PRETRAINED_MODEL_NAME")
+	finetuneType = os.Getenv("FINETUNE_TYPE")
+	loraSetting := os.Getenv("LORA_SETTING")
+	if loraSetting != "" {
+		if finetuneType == "" {
+			finetuneType = "lora"
 		}
-
-		// 获取leader地址
-		if leaderAddr := os.Getenv("LWS_LEADER_ADDRESS"); leaderAddr != "" {
-
-			distPort := os.Getenv("DIST_PORT")
-			if distPort == "" {
-				distPort = "20000"
-			}
-			extraArgs += fmt.Sprintf(" --dist-init-addr %s:%s", leaderAddr, distPort)
-		}
-
-		// 获取worker索引
-		if workerIndex := os.Getenv("LWS_WORKER_INDEX"); workerIndex != "" {
-			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
-		}
+		extraArgs += loraSetting
+	}
+	globalEnableThinkingStr := os.Getenv("GLOBAL_ENABLE_THINKING")
+	if globalEnableThinkingStr == "false" {
+		globalEnableThinking = false
 	}
 
 	// 构建完整的启动命令
@@ -295,8 +301,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 启动监控协程
 	go monitorSubprocess(cmd)
 
+	server = fmt.Sprintf(server, httpServerPort)
 	// 等待服务就绪
-	if err := waitServerReady(fmt.Sprintf("http://localhost:%d/health", httpServerPort)); err != nil {
+	if err := waitServerReady(fmt.Sprintf("%s/health", server)); err != nil {
 		return fmt.Errorf("server failed to start: %v", err)
 	}
 
@@ -304,7 +311,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	//go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort))
 
 	// 初始化OpenAI客户端
-	serverURL := fmt.Sprintf("http://127.0.0.1:%d/v1", httpServerPort)
+	serverURL := fmt.Sprintf("%s/v1", server)
 	client := NewOpenAIClient(serverURL)
 
 	// 初始化请求管理器并保存到全局变量
@@ -317,6 +324,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 	} else {
 		wLogger.Infow("Warmup completed successfully")
 	}
+	// 初始化patchIdMap
+	patchResMap = make(map[string]PatchRes)
+	patchIdInnerPatchIdMap = make(map[string]string)
 
 	wLogger.Debugw("WrapperInit successful")
 	return
@@ -372,7 +382,13 @@ func waitServerReady(serverURL string) error {
 		Timeout: HTTP_SERVER_REQUEST_TIMEOUT,
 	}
 	maxRetries := 0
-	timeInerval := time.Second // 请求间隔
+	var timeInerval time.Duration // 请求间隔
+	timeBegin := time.Now()
+	waitTime := func() {
+		time.Sleep(5 * time.Second)
+		timeInerval = time.Now().Sub(timeBegin)
+		maxRetries++
+	}
 	for i := 0; timeInerval < HTTP_SERVER_MAX_RETRY_TIME; i++ {
 		resp, err := httpClient.Get(serverURL)
 		wLogger.Debugw("Server resp", "resp", resp, "err", err)
@@ -381,29 +397,22 @@ func waitServerReady(serverURL string) error {
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 			healthStatus := Health{}
 			err = json.Unmarshal(body, &healthStatus)
 			if err != nil {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 			wLogger.Debugw("Server resp body", "body", healthStatus)
 			if healthStatus.Status != HealthStatusUp {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 
 			wLogger.Debugw("Server ready", "url", serverURL)
-			resp.Body.Close()
 			return nil
 		}
 
@@ -412,9 +421,7 @@ func waitServerReady(serverURL string) error {
 		}
 
 		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		time.Sleep(timeInerval)
-		timeInerval *= 2 // 每次重试增加间隔
-		maxRetries++
+		waitTime()
 	}
 	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
 }
@@ -581,10 +588,10 @@ type ExtraParams struct {
 
 func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, req *openai.ChatCompletionRequest) error {
 	openaiTools := make([]openai.Tool, len(functions))
-	for i, f := range functions {
+	for i := range functions {
 		openaiTools[i] = openai.Tool{
 			Type:     "function",
-			Function: &f,
+			Function: &functions[i],
 		}
 	}
 	req.Tools = openaiTools
@@ -699,23 +706,40 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		streamReq := &openai.ChatCompletionRequest{
-			Model: "default",
-		}
+		modelName := DEFAULT_MODEL_NAME
+		lora_path := ""
+		if finetuneType == "lora" || finetuneType == "qlora" {
+			if patch_id, ok := inst.params["patch_id"]; ok && patch_id != "" {
+				patchIdMapMutex.RLock()
+				if lora_path, ok = patchIdInnerPatchIdMap[patch_id]; ok {
+					lora_path = patch_id
+				} else {
+					wLogger.Errorw("lora or qlora infer, but lora path is invalid ", "patch_id", patch_id, "sid", inst.sid)
+				}
+				patchIdMapMutex.RUnlock()
 
+			}
+		}
+		streamReq := &openai.ChatCompletionRequest{
+			Model: modelName,
+		}
+		enableThinking := globalEnableThinking
+
+		if enable_thinking, ok := inst.params["enable_thinking"]; ok {
+			if enable_thinking == "false" {
+				enableThinking = false
+			} else {
+				enableThinking = true
+			}
+		}
 		streamReq.ExtraBody = map[string]any{
 			"chat_template_kwargs": map[string]interface{}{
-				"enable_thinking": false,
+				"enable_thinking": enableThinking,
 			},
 		}
-		if enable_thinking, ok := inst.params["enable_thinking"]; ok {
-			if enable_thinking == "true" {
-				streamReq.ExtraBody = map[string]any{
-					"chat_template_kwargs": map[string]interface{}{
-						"enable_thinking": true,
-					},
-				}
-			}
+		if lora_path != "" {
+			// enable_thinking 为true有效果
+			streamReq.ExtraBody["lora_path"] = lora_path
 		}
 		// 从params中获取 extra_body
 		extra_parms := ""
@@ -1013,11 +1037,273 @@ func WrapperVersion() (version string) {
 
 // WrapperLoadRes 加载资源
 func WrapperLoadRes(res comwrapper.WrapperData, resId int) (err error) {
+	wLogger.Debugw("WrapperLoadRes", "res", toString(res.Desc), res.Key)
+	if res.Desc == nil {
+		return fmt.Errorf("missing desc")
+	}
+	patch_id, ok := res.Desc["patch_id"]
+	if !ok {
+		return fmt.Errorf("missing patch_id in desc")
+	}
+	patchIdMapMutex.Lock()
+	resIdStr := strconv.Itoa(resId)
+	if _, ok := patchResMap[resIdStr]; ok {
+		wLogger.Warnw("WrapperLoadRes resId already loaded", "resId", resId)
+		patchIdMapMutex.Unlock()
+		return nil
+	}
+	patchIdMapMutex.Unlock()
+
+	loraWeightPath := filepath.Join(LORA_WEIGHT_PATH, patch_id)
+	// 判断路径是否存在
+	if _, err := os.Stat(loraWeightPath); err == nil {
+		wLogger.Warnw("WrapperLoadRes path already exist", "resId", resId, "path", loraWeightPath)
+	}
+
+	// 创建buffer并解压zip文件
+	buffer := bytes.NewBuffer(res.Data)
+	if err := extractZipToPath(buffer, loraWeightPath); err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to extract zip", "resId", resId, "error", err)
+		return fmt.Errorf("failed to extract zip: %v", err)
+	}
+
+	err = lora_load(pretrainedName, loraWeightPath, patch_id)
+	if err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to load lora", "resId", resId, "error", err)
+		return fmt.Errorf("failed to load lora: %v", err)
+	}
+	// 将路径存储到map中
+	patchIdMapMutex.Lock()
+	patchResMap[resIdStr] = PatchRes{
+		InnerPatchId: resIdStr,
+		PatchId:      patch_id,
+		LoraPath:     loraWeightPath,
+	}
+	patchIdInnerPatchIdMap[patch_id] = resIdStr
+	patchIdMapMutex.Unlock()
+	wLogger.Infow("WrapperLoadRes success", "resId", resId, "path", loraWeightPath)
 	return
+}
+func lora_load(pretrainedName, loraWeightPath, loraIdStr string) error {
+	isValid, msg := checkValidLora(pretrainedName, loraWeightPath)
+	if !isValid {
+		wLogger.Errorw(msg)
+		return fmt.Errorf(msg)
+	}
+	wLogger.Debugf("checkValidLora:%v", msg)
+
+	// lora 加载
+	// TODO: 实现lora加载逻辑
+	loadResp, err := PostRequest(fmt.Sprintf("%v/%v", server, loadLoraAdapter), map[string]interface{}{
+		"lora_name": loraIdStr,
+		"lora_path": loraWeightPath,
+		// "base_model_name": pretrainedName,
+	})
+	if err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to load lora", "resId", loraIdStr, "error", err)
+		return fmt.Errorf("failed to load lora: %v", err)
+	}
+	wLogger.Debugf("WrapperLoadRes load lora success, resId:%v, loadResp:%v", loraIdStr, string(loadResp))
+
+	return nil
+}
+
+// func lora_load_init() {
+// 	// // 判断路径是否存在
+// 	// if _, err := os.Stat(LORA_RECORD_PATH); err != nil {
+// 	// 	wLogger.Errorw("lora_load path err", "path", LORA_RECORD_PATH, "err", err)
+// 	// 	return
+// 	// }
+// 	if _, err := os.Stat(LORA_WEIGHT_PATH); err != nil {
+// 		wLogger.Errorw("lora_load path err", "path", LORA_WEIGHT_PATH, "err", err)
+// 		return
+// 	}
+// 	// recordfiles, err := os.ReadDir(LORA_RECORD_PATH)
+// 	// if err != nil {
+// 	// 	wLogger.Errorw("lora_load read dir err", "path", LORA_RECORD_PATH, "err", err)
+// 	// 	return
+// 	// }
+// 	weightfiles, err := os.ReadDir(LORA_WEIGHT_PATH)
+// 	if err != nil {
+// 		wLogger.Errorw("lora_load read dir err", "path", LORA_WEIGHT_PATH, "err", err)
+// 		return
+// 	}
+// 	weightMap := make(map[string]struct{}, len(weightfiles))
+// 	for _, file := range weightfiles {
+// 		weightPath := filepath.Join(LORA_WEIGHT_PATH, file.Name())
+// 		err = lora_load(pretrainedName, weightPath, file.Name())
+// 		if err != nil {
+// 			wLogger.Errorw("lora_load failed to load lora", "path", weightPath, "error", err)
+// 			continue
+// 		}
+// 		wLogger.Infow("lora_load load success", "path", weightPath)
+// 		weightMap[file.Name()] = struct{}{}
+// 	}
+// }
+
+// extractZipToPath 从内存中的zip数据解压到指定路径
+func extractZipToPath(zipData *bytes.Buffer, extractPath string) error {
+	// 创建zip reader
+	zipReader, err := zip.NewReader(bytes.NewReader(zipData.Bytes()), int64(zipData.Len()))
+	if err != nil {
+		return fmt.Errorf("failed to create zip reader: %v", err)
+	}
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(extractPath, 0755); err != nil {
+		return fmt.Errorf("failed to create extract directory: %v", err)
+	}
+
+	// 遍历zip文件中的所有文件
+	for _, file := range zipReader.File {
+		// 构建完整的文件路径
+		filePath := filepath.Join(extractPath, file.Name)
+
+		// 检查文件路径是否安全（防止zip slip攻击）
+		if !strings.HasPrefix(filePath, filepath.Clean(extractPath)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", file.Name)
+		}
+
+		// 如果是目录，创建目录
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(filePath, file.Mode()); err != nil {
+				return fmt.Errorf("failed to create directory %s: %v", filePath, err)
+			}
+			continue
+		}
+
+		// 确保父目录存在
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent directory for %s: %v", filePath, err)
+		}
+
+		// 打开zip文件
+		rc, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file %s in zip: %v", file.Name, err)
+		}
+
+		// 创建目标文件
+		targetFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("failed to create file %s: %v", filePath, err)
+		}
+
+		// 复制文件内容
+		_, err = io.Copy(targetFile, rc)
+		targetFile.Close()
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("failed to write file %s: %v", filePath, err)
+		}
+	}
+
+	return nil
+}
+
+func checkValidLora(pretrainedName string, loraPath string) (isValid bool, msg string) {
+	configJsonPath := filepath.Join(loraPath, "adapter_config.json")
+	if _, err := os.Stat(configJsonPath); os.IsNotExist(err) {
+		msg = fmt.Sprintf("%v not find", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 打开并读取配置文件
+	file, err := os.Open(configJsonPath)
+	if err != nil {
+		msg = fmt.Sprintf("failed to open %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+	defer file.Close()
+
+	// 读取文件内容
+	content, err := io.ReadAll(file)
+	if err != nil {
+		msg = fmt.Sprintf("failed to read %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 解析JSON
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		msg = fmt.Sprintf("invalid JSON format in %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 检查是否包含base_model_name_or_path字段
+	if _, exists := config["base_model_name_or_path"]; !exists {
+		msg = fmt.Sprintf("missing base_model_name_or_path field in %v", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 检查base_model_name_or_path是否与pretrainedName匹配
+	baseModelPath, ok := config["base_model_name_or_path"].(string)
+	if !ok {
+		msg = fmt.Sprintf("base_model_name_or_path is not a string in %v", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	if baseModelPath != pretrainedName {
+		msg = fmt.Sprintf("base_model_name_or_path mismatch: expected %v, got %v", pretrainedName, baseModelPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	wLogger.Infow("Lora validation successful", "pretrainedName", pretrainedName, "loraPath", loraPath)
+	return true, ""
 }
 
 // WrapperUnloadRes 卸载资源
 func WrapperUnloadRes(resId int) (err error) {
+	wLogger.Debugf("WrapperUnloadRes unload lora start", "resId", resId)
+	resIdStr := strconv.Itoa(resId)
+	patchIdMapMutex.Lock()
+	patchRes, ok := patchResMap[resIdStr]
+	if !ok {
+		wLogger.Warnw("WrapperUnloadRes resId not loaded", "resId", resId)
+		patchIdMapMutex.Unlock()
+		return nil
+	}
+	patchIdMapMutex.Unlock()
+	loraWeightPath := patchRes.LoraPath
+	if _, err := os.Stat(loraWeightPath); os.IsNotExist(err) {
+		wLogger.Errorw("WrapperLoadRes path does not exist", "resId", resId, "path", loraWeightPath)
+		return fmt.Errorf("path does not exist: %s", loraWeightPath)
+	}
+
+	// 卸载lora
+	unloadResp, err := PostRequest(fmt.Sprintf("%v/%v", server, unloadLoraAdapter), map[string]interface{}{
+		"lora_name": patchRes.PatchId,
+	})
+	if err != nil {
+		wLogger.Errorw("WrapperUnloadRes failed to unload lora", "resId", resId, "error", err)
+		return fmt.Errorf("failed to unload lora: %v", err)
+	}
+	wLogger.Debugf("WrapperUnloadRes unload lora success, resId:%v, unloadResp:%v", resId, string(unloadResp))
+
+	// // 删除记录
+	// os.Remove(filepath.Join("/home/.atp/lora_record", resIdStr))
+
+	// 递归删除lora目录
+	if err := os.RemoveAll(loraWeightPath); err != nil {
+		wLogger.Errorw("WrapperUnloadRes failed to remove lora directory", "resId", resId, "path", loraWeightPath, "error", err)
+		return err
+	} else {
+		wLogger.Infow("WrapperUnloadRes removed lora directory", "resId", resId, "path", loraWeightPath)
+	}
+
+	patchIdMapMutex.Lock()
+	delete(patchResMap, resIdStr)
+	delete(patchIdInnerPatchIdMap, patchRes.PatchId)
+	patchIdMapMutex.Unlock()
+
 	return
 }
 
@@ -1425,22 +1711,6 @@ func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers
 		}
 	}
 
-	// 创建请求
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	// 设置默认Content-Type
-	if jsonData != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	// 设置自定义headers
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
 	// 重试机制
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -1449,32 +1719,33 @@ func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers
 			time.Sleep(1 * time.Second)
 		}
 
-		// 每次重试时重新创建请求，避免请求体被消耗的问题
-		var retryReq *http.Request
-		if attempt == 0 {
-			retryReq = req
-		} else {
-			// 重新创建请求
-			retryReq, err = http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
-			if err != nil {
-				lastErr = fmt.Errorf("failed to create retry request: %v", err)
-				continue
-			}
-			// 复制原始请求的headers
-			for key, values := range req.Header {
-				retryReq.Header[key] = values
-			}
+		// 每次重试都重新创建请求，确保请求体完整
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create request: %v", err)
+			continue
+		}
+
+		// 设置默认Content-Type
+		if jsonData != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		// 设置自定义headers
+		for key, value := range headers {
+			req.Header.Set(key, value)
 		}
 
 		// 发送请求
-		resp, err := client.Do(retryReq)
+		resp, err := client.Do(req)
 		if logLevel == "debug" {
 			errorMsg := ""
 			if err != nil {
 				errorMsg = err.Error()
 			}
-			wLogger.Debugw("Post process", "req", toString(retryReq), "resp", toString(resp), "error", errorMsg)
+			wLogger.Debugw("Post process", "req", toString(req), "resp", toString(resp), "error", errorMsg)
 		}
+
 		if err != nil {
 			lastErr = fmt.Errorf("request failed (attempt %d): %v", attempt+1, err)
 			continue
@@ -1490,11 +1761,11 @@ func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers
 
 		// 检查HTTP状态码
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			wLogger.Debugw("POST request successful", "url", url, "status", resp.StatusCode)
+			wLogger.Debugw("POST request successful", "url", url, "status", resp.StatusCode, "attempt", attempt+1)
 			return body, nil
 		}
 
-		// 如果不是成功状态码，记录错误但继续重试
+		// 记录错误信息
 		lastErr = fmt.Errorf("HTTP error (attempt %d): %s - %s", attempt+1, resp.Status, string(body))
 
 		// 如果是4xx错误，不重试
