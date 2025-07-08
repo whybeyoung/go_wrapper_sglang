@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"comwrapper"
 	"context"
 	"encoding/json"
@@ -39,10 +41,16 @@ var (
 	temperature                 = 0.95
 	maxTokens                   = 2048
 	topP                        = 0.95
-	promptSearchTemplate        string // 添加全局变量存储搜索模板
-	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
-	isReasoningModel            bool
-	cmd                         *exec.Cmd
+	promptSearchTemplate        string   // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex string   // 添加全局变量存储不带索引的搜索模板
+	finetuneType                = "lora" // 添加全局变量存储finetune类型
+	// inferType                   string            // 添加全局变量存储推理类型
+	patchIdMap       map[string]string       // 添加全局变量存储patch id map
+	patchIdMapMutex  sync.Mutex              // 添加锁保护patchIdMap
+	pretrainedName   string                  // 添加全局变量存储pretrained name
+	server           = "http://127.0.0.1:%d" // 添加全局变量存储server url
+	isReasoningModel bool
+	cmd              *exec.Cmd
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -57,6 +65,8 @@ const (
 	STREAM_CONNECT_TIMEOUT          = "stream connect timeout"
 	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
 	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
+	LORA_WEIGHT_PATH                = "/home/.atp/lora_weight"
+	LORA_RECORD_PATH                = "/home/.atp/lora_record"
 )
 
 // RequestManager 请求管理器
@@ -243,6 +253,16 @@ func WrapperInit(cfg map[string]string) (err error) {
 		}
 	}
 
+	pretrainedName = os.Getenv("PRETRAINED_MODEL_NAME")
+	finetuneType = os.Getenv("FINETUNE_TYPE")
+	if finetuneType == "" {
+		finetuneType = "lora"
+	}
+	enableLora := os.Getenv("ENABLE_LORA")
+	if enableLora == "true" {
+		extraArgs += fmt.Sprintf(" --lora-paths %s", "")
+	}
+
 	// 构建完整的启动命令
 	args := []string{
 		"-m", "sglang.launch_server",
@@ -292,8 +312,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 启动监控协程
 	go monitorSubprocess(cmd)
 
+	server = fmt.Sprintf(server, httpServerPort)
 	// 等待服务就绪
-	if err := waitServerReady(fmt.Sprintf("http://localhost:%d/health", httpServerPort)); err != nil {
+	if err := waitServerReady(fmt.Sprintf("%s/health", server)); err != nil {
 		return fmt.Errorf("server failed to start: %v", err)
 	}
 
@@ -301,11 +322,14 @@ func WrapperInit(cfg map[string]string) (err error) {
 	//go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort))
 
 	// 初始化OpenAI客户端
-	serverURL := fmt.Sprintf("http://127.0.0.1:%d/v1", httpServerPort)
+	serverURL := fmt.Sprintf("%s/v1", server)
 	client := NewOpenAIClient(serverURL)
 
 	// 初始化请求管理器并保存到全局变量
 	requestManager = NewRequestManager(client)
+
+	// 初始化patchIdMap
+	patchIdMap = make(map[string]string)
 
 	wLogger.Debugw("WrapperInit successful")
 	return
@@ -642,8 +666,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
+		modelName := "default"
+		if finetuneType == "lora" || finetuneType == "qlora" {
+			if patch_id, ok := inst.params["patch_id"]; ok {
+				patchIdMapMutex.Lock()
+				if _, ok := patchIdMap[patch_id]; ok {
+					modelName = patch_id
+				} else {
+					wLogger.Errorw("lora or qlora infer, but lora path is invalid ", "patch_id", patch_id, "sid", inst.sid)
+				}
+				patchIdMapMutex.Unlock()
+
+			}
+		}
 		streamReq := &openai.ChatCompletionRequest{
-			Model: "default",
+			Model: modelName,
 		}
 
 		streamReq.ExtraBody = map[string]any{
@@ -956,11 +993,354 @@ func WrapperVersion() (version string) {
 
 // WrapperLoadRes 加载资源
 func WrapperLoadRes(res comwrapper.WrapperData, resId int) (err error) {
+	patchIdMapMutex.Lock()
+	resIdStr := strconv.Itoa(resId)
+	if _, ok := patchIdMap[resIdStr]; ok {
+		wLogger.Warnw("WrapperLoadRes resId already loaded", "resId", resId)
+		patchIdMapMutex.Unlock()
+		return nil
+	}
+	patchIdMapMutex.Unlock()
+
+	loraWeightPath := filepath.Join(LORA_WEIGHT_PATH, resIdStr)
+	// 判断路径是否存在
+	if _, err := os.Stat(loraWeightPath); err == nil {
+		wLogger.Warnw("WrapperLoadRes path already exist", "resId", resId, "path", loraWeightPath)
+	}
+
+	// 创建buffer并解压zip文件
+	buffer := bytes.NewBuffer(res.Data)
+	if err := extractZipToPath(buffer, loraWeightPath); err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to extract zip", "resId", resId, "error", err)
+		return fmt.Errorf("failed to extract zip: %v", err)
+	}
+
+	// write record
+	recordPath := filepath.Join(LORA_RECORD_PATH, resIdStr)
+	recordFile, err := os.OpenFile(recordPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to open record file", "resId", resId, "error", err)
+		return fmt.Errorf("failed to open record file: %v", err)
+	}
+	recordFile.Close()
+
+	err = lora_load(pretrainedName, loraWeightPath, resIdStr)
+	if err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to load lora", "resId", resId, "error", err)
+		return fmt.Errorf("failed to load lora: %v", err)
+	}
+
+	wLogger.Infow("WrapperLoadRes success", "resId", resId, "path", loraWeightPath)
 	return
+}
+func lora_load(pretrainedName, loraWeightPath, loraIdStr string) error {
+	isValid, msg := checkValidLora(pretrainedName, loraWeightPath)
+	if !isValid {
+		wLogger.Errorw(msg)
+		return fmt.Errorf(msg)
+	}
+	wLogger.Debugf("checkValidLora:%v", msg)
+
+	// lora 加载
+	// TODO: 实现lora加载逻辑
+	loadResp, err := PostRequest(fmt.Sprintf("%v/load_lora_adapter", server), map[string]interface{}{
+		"lora_name": loraIdStr,
+		"lora_path": loraWeightPath,
+		// "base_model_name": pretrainedName,
+	})
+	if err != nil {
+		wLogger.Errorw("WrapperLoadRes failed to load lora", "resId", loraIdStr, "error", err)
+		return fmt.Errorf("failed to load lora: %v", err)
+	}
+	wLogger.Debugf("WrapperLoadRes load lora success, resId:%v, loadResp:%v", loraIdStr, string(loadResp))
+
+	// 将路径存储到map中
+	patchIdMapMutex.Lock()
+	patchIdMap[loraIdStr] = loraWeightPath
+	patchIdMapMutex.Unlock()
+	return nil
+}
+
+func lora_load_init() {
+	// 判断路径是否存在
+	if _, err := os.Stat(LORA_RECORD_PATH); err != nil {
+		wLogger.Errorw("lora_load path err", "path", LORA_RECORD_PATH, "err", err)
+		return
+	}
+	if _, err := os.Stat(LORA_WEIGHT_PATH); err != nil {
+		wLogger.Errorw("lora_load path err", "path", LORA_WEIGHT_PATH, "err", err)
+		return
+	}
+	recordfiles, err := os.ReadDir(LORA_RECORD_PATH)
+	if err != nil {
+		wLogger.Errorw("lora_load read dir err", "path", LORA_RECORD_PATH, "err", err)
+		return
+	}
+	weightfiles, err := os.ReadDir(LORA_WEIGHT_PATH)
+	if err != nil {
+		wLogger.Errorw("lora_load read dir err", "path", LORA_WEIGHT_PATH, "err", err)
+		return
+	}
+	weightMap := make(map[string]struct{}, len(weightfiles))
+	for _, file := range weightfiles {
+		weightMap[file.Name()] = struct{}{}
+	}
+	for _, file := range recordfiles {
+		weightPath := filepath.Join(LORA_WEIGHT_PATH, file.Name())
+		if _, ok := weightMap[file.Name()]; !ok {
+			wLogger.Warnw("lora_load record file not found", "path", weightPath)
+			continue
+		}
+
+		err = lora_load(pretrainedName, weightPath, file.Name())
+		if err != nil {
+			wLogger.Errorw("lora_load failed to load lora", "path", weightPath, "error", err)
+			continue
+		}
+		wLogger.Infow("lora_load load success", "path", weightPath)
+	}
+}
+
+// extractZipToPath 从内存中的zip数据解压到指定路径
+func extractZipToPath(zipData *bytes.Buffer, extractPath string) error {
+	// 创建zip reader
+	zipReader, err := zip.NewReader(bytes.NewReader(zipData.Bytes()), int64(zipData.Len()))
+	if err != nil {
+		return fmt.Errorf("failed to create zip reader: %v", err)
+	}
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(extractPath, 0755); err != nil {
+		return fmt.Errorf("failed to create extract directory: %v", err)
+	}
+
+	// 遍历zip文件中的所有文件
+	for _, file := range zipReader.File {
+		// 构建完整的文件路径
+		filePath := filepath.Join(extractPath, file.Name)
+
+		// 检查文件路径是否安全（防止zip slip攻击）
+		if !strings.HasPrefix(filePath, filepath.Clean(extractPath)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", file.Name)
+		}
+
+		// 如果是目录，创建目录
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(filePath, file.Mode()); err != nil {
+				return fmt.Errorf("failed to create directory %s: %v", filePath, err)
+			}
+			continue
+		}
+
+		// 确保父目录存在
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent directory for %s: %v", filePath, err)
+		}
+
+		// 打开zip文件
+		rc, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file %s in zip: %v", file.Name, err)
+		}
+
+		// 创建目标文件
+		targetFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("failed to create file %s: %v", filePath, err)
+		}
+
+		// 复制文件内容
+		_, err = io.Copy(targetFile, rc)
+		targetFile.Close()
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("failed to write file %s: %v", filePath, err)
+		}
+	}
+
+	return nil
+}
+
+// PostRequest 发送POST请求（使用默认参数）
+func PostRequest(url string, jsonData map[string]interface{}) ([]byte, error) {
+	return PostRequestWithOptions(url, jsonData, nil, 3, 10*time.Second)
+}
+
+// PostRequestWithOptions 发送POST请求（自定义参数）
+func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers map[string]string, maxRetries int, timeout time.Duration) ([]byte, error) {
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: timeout,
+	}
+
+	// 准备请求体
+	var requestBody []byte
+	var err error
+
+	if jsonData != nil {
+		requestBody, err = json.Marshal(jsonData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal json data: %v", err)
+		}
+	}
+
+	// 创建请求
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// 设置默认Content-Type
+	if jsonData != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// 设置自定义headers
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	// 重试机制
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			wLogger.Debugw("Retrying POST request", "attempt", attempt, "url", url)
+			time.Sleep(1 * time.Second)
+		}
+
+		// 发送请求
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request failed (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// 读取响应
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// 检查HTTP状态码
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			wLogger.Debugw("POST request successful", "url", url, "status", resp.StatusCode)
+			return body, nil
+		}
+
+		// 如果不是成功状态码，记录错误但继续重试
+		lastErr = fmt.Errorf("HTTP error (attempt %d): %s - %s", attempt+1, resp.Status, string(body))
+
+		// 如果是4xx错误，不重试
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			wLogger.Warnw("Client error, not retrying", "status", resp.StatusCode, "body", string(body))
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("all retry attempts failed. Last error: %v", lastErr)
+}
+
+func checkValidLora(pretrainedName string, loraPath string) (isValid bool, msg string) {
+	configJsonPath := filepath.Join(loraPath, "adapter_config.json")
+	if _, err := os.Stat(configJsonPath); os.IsNotExist(err) {
+		msg = fmt.Sprintf("%v not find", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 打开并读取配置文件
+	file, err := os.Open(configJsonPath)
+	if err != nil {
+		msg = fmt.Sprintf("failed to open %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+	defer file.Close()
+
+	// 读取文件内容
+	content, err := io.ReadAll(file)
+	if err != nil {
+		msg = fmt.Sprintf("failed to read %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 解析JSON
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		msg = fmt.Sprintf("invalid JSON format in %v: %v", configJsonPath, err)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 检查是否包含base_model_name_or_path字段
+	if _, exists := config["base_model_name_or_path"]; !exists {
+		msg = fmt.Sprintf("missing base_model_name_or_path field in %v", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	// 检查base_model_name_or_path是否与pretrainedName匹配
+	baseModelPath, ok := config["base_model_name_or_path"].(string)
+	if !ok {
+		msg = fmt.Sprintf("base_model_name_or_path is not a string in %v", configJsonPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	if baseModelPath != pretrainedName {
+		msg = fmt.Sprintf("base_model_name_or_path mismatch: expected %v, got %v", pretrainedName, baseModelPath)
+		wLogger.Errorw(msg)
+		return false, msg
+	}
+
+	wLogger.Infow("Lora validation successful", "pretrainedName", pretrainedName, "loraPath", loraPath)
+	return true, ""
 }
 
 // WrapperUnloadRes 卸载资源
 func WrapperUnloadRes(resId int) (err error) {
+	resIdStr := strconv.Itoa(resId)
+	patchIdMapMutex.Lock()
+	loraWeightPath, ok := patchIdMap[resIdStr]
+	if !ok {
+		wLogger.Warnw("WrapperUnloadRes resId not loaded", "resId", resId)
+		patchIdMapMutex.Unlock()
+		return nil
+	}
+	if _, err := os.Stat(loraWeightPath); os.IsNotExist(err) {
+		wLogger.Errorw("WrapperLoadRes path does not exist", "resId", resId, "path", loraWeightPath)
+		return fmt.Errorf("path does not exist: %s", loraWeightPath)
+	}
+
+	// 卸载lora
+	unloadResp, err := PostRequest(fmt.Sprintf("%v/unload_lora_adapter", server), map[string]interface{}{
+		"lora_name": resIdStr,
+	})
+	if err != nil {
+		wLogger.Errorw("WrapperUnloadRes failed to unload lora", "resId", resId, "error", err)
+		return fmt.Errorf("failed to unload lora: %v", err)
+	}
+	wLogger.Debugf("WrapperUnloadRes unload lora success, resId:%v, unloadResp:%v", resId, string(unloadResp))
+
+	// 删除记录
+	os.Remove(filepath.Join("/home/.atp/lora_record", resIdStr))
+
+	// 递归删除lora目录
+	if err := os.RemoveAll(loraWeightPath); err != nil {
+		wLogger.Errorw("WrapperUnloadRes failed to remove lora directory", "resId", resId, "path", loraWeightPath, "error", err)
+		return err
+	} else {
+		wLogger.Infow("WrapperUnloadRes removed lora directory", "resId", resId, "path", loraWeightPath)
+	}
+
+	patchIdMapMutex.Lock()
+	delete(patchIdMap, resIdStr)
+	patchIdMapMutex.Unlock()
+
 	return
 }
 

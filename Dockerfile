@@ -16,7 +16,7 @@ RUN apt-get update && \
     /usr/local/bin/python -m pip install --upgrade pip && \
     pip install sgl-kernel==0.1.0 && \
     pip install  --upgrade mooncake_transfer_engine==0.3.0b6 pyverbs prometheus-client && \
-    pip install "sglang[all]==0.4.7" && \
+    pip install "sglang[all]==0.4.9" && \
     rm -rf /var/lib/apt/lists/*
 #ADD /vendor/github.com/sgl-project/sglang /home/aiges/src/github.com/sgl-project/sglang
 #ADD ./engine_start_test.sh /home/aiges
