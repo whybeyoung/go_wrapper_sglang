@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"comwrapper"
 	"context"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +54,7 @@ var (
 	LbExtraFunc                 func(params map[string]string) error
 	throughputMax               float64
 	isGoRecvTokenizer           bool = true // 是否是 Go Recv Tokenizer 模式
+	serviceName                 string
 )
 
 const (
@@ -544,6 +547,12 @@ func WrapperInit(cfg map[string]string) (err error) {
 		throughputMax, _ = strconv.ParseFloat(v, 64)
 	}
 
+	// 获取serviceName
+	serviceName, _ = GetCurrentProcessService()
+	if serviceName == "" {
+		serviceName = "sglang"
+	}
+
 	// 创建日志目录
 	logDir := filepath.Dir(logPath)
 	if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -571,6 +580,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		zLogger.Errorw("Failed to create zmq logger", "error", err)
 		return
 	}
+	zLogger.Infow("Start Service: ", "serviceName", serviceName)
 
 	if promptSearchTemplate != "" {
 		wLogger.Infow("Using custom prompt search template")
@@ -680,6 +690,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		"--port", strconv.Itoa(httpServerPort),
 		"--trust-remote",
 		"--host", "0.0.0.0",
+		"--served-model-name", serviceName,
 	}
 	// 添加额外参数
 	args = append(args, strings.Fields(extraArgs)...)
@@ -728,7 +739,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 等待服务就绪
-	if err := waitServerReady(fmt.Sprintf("http://localhost:%d/health", httpServerPort)); err != nil {
+	if err := waitServerReady(fmt.Sprintf("http://localhost:%d/%s", httpServerPort, "health")); err != nil {
 		return fmt.Errorf("server failed to start: %v", err)
 	}
 
@@ -827,6 +838,16 @@ func waitServerReady(serverURL string) error {
 	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
 }
 
+func abortRequest(serverUrl, requstid string) {
+	resp, err := http.Post(serverUrl, "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"rid": "%s"}`, requstid))))
+	if err != nil {
+		wLogger.Errorw("Failed to abort request", "error", err, "sid", requstid)
+		return
+	}
+	defer resp.Body.Close()
+
+}
+
 // getLocalIP 获取本地IP
 func getLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
@@ -847,7 +868,7 @@ func (inst *wrapperInst) handleRidResponse() {
 	var finished bool = false
 	var ttft time.Duration
 
-	defer inst.closeHttpStream()
+	defer inst.abortRequest(inst.sid)
 
 	for {
 		if !inst.active {
@@ -1012,7 +1033,8 @@ func (inst *wrapperInst) handleRidResponse() {
 
 }
 
-func (inst *wrapperInst) closeHttpStream() {
+func (inst *wrapperInst) abortRequest(sid string) {
+	abortRequest(fmt.Sprintf("http://localhost:%d/%s", httpServerPort, "abort_request"), sid)
 	if inst.Stream != nil {
 		inst.Stream.Close()
 	}
@@ -1745,6 +1767,51 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+}
+
+// 读取进程中-s 参数
+// extractServiceParam 从命令行参数中提取-s参数的值
+func extractServiceParam(cmdline string) string {
+	// 使用正则表达式匹配-s=后面的值
+	// 支持以下格式:
+	// -s=value
+	// -s value
+	re := regexp.MustCompile(`-s[=\s]+([^\s]+)`)
+	matches := re.FindStringSubmatch(cmdline)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// GetCurrentProcessService 获取当前进程的-s参数值
+func GetCurrentProcessService() (string, error) {
+	// 方法1: 使用os.Args获取当前进程的命令行参数
+	if len(os.Args) > 0 {
+		// 将所有参数连接成一个字符串
+		cmdline := strings.Join(os.Args, " ")
+		service := extractServiceParam(cmdline)
+		if service != "" {
+			return service, nil
+		}
+	}
+
+	// 方法2: 读取/proc/self/cmdline文件
+	cmdlineData, err := os.ReadFile("/proc/self/cmdline")
+	if err != nil {
+		return "", fmt.Errorf("failed to read /proc/self/cmdline: %v", err)
+	}
+
+	// cmdline文件中参数以null字符分隔，转换为空格分隔
+	cmdline := strings.ReplaceAll(string(cmdlineData), "\x00", " ")
+	cmdline = strings.TrimSpace(cmdline)
+
+	service := extractServiceParam(cmdline)
+	if service == "" {
+		return "", fmt.Errorf("service parameter (-s) not found in current process")
+	}
+
+	return service, nil
 }
 
 // monitorSubprocess 监控子进程
