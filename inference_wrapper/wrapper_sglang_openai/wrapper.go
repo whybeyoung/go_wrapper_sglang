@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"comwrapper"
 	"context"
 	"encoding/json"
@@ -43,6 +44,7 @@ var (
 	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
 	isReasoningModel            bool
 	cmd                         *exec.Cmd
+	mockMode                    bool = false // 添加mock模式开关
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -306,6 +308,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 初始化请求管理器并保存到全局变量
 	requestManager = NewRequestManager(client)
+
+	// 检查是否启用预热
+	if err := WarmupRequest(fmt.Sprintf("http://localhost:%d/v1/chat/completions", httpServerPort), "/home/aiges/warmup-data.json"); err != nil {
+		wLogger.Errorw("Warmup failed", "error", err)
+	} else {
+		wLogger.Infow("Warmup completed successfully")
+	}
 
 	wLogger.Debugw("WrapperInit successful")
 	return
@@ -1257,4 +1266,171 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 		}
 	}
 	return openAIMessages
+}
+
+// WarmupPrompt 预热请求数据结构
+type WarmupPrompt struct {
+	Prompt      string  `json:"prompt"`
+	MaxTokens   int     `json:"max_tokens"`
+	Temperature float64 `json:"temperature"`
+	Type        string  `json:"type"`
+}
+
+// WarmupRequest 发送预热请求
+func WarmupRequest(serverURL string, warmupDataPath string) error {
+	wLogger.Infow("Starting warmup process", "serverURL", serverURL, "warmupDataPath", warmupDataPath)
+
+	// 读取预热数据文件
+	data, err := os.ReadFile(warmupDataPath)
+	if err != nil {
+		wLogger.Errorw("Failed to read warmup data file", "error", err, "path", warmupDataPath)
+		return fmt.Errorf("failed to read warmup data file: %v", err)
+	}
+
+	// 解析JSON数据
+	var warmupPrompts []WarmupPrompt
+	if err := json.Unmarshal(data, &warmupPrompts); err != nil {
+		wLogger.Errorw("Failed to parse warmup data", "error", err)
+		return fmt.Errorf("failed to parse warmup data: %v", err)
+	}
+
+	if len(warmupPrompts) == 0 {
+		wLogger.Warnw("No warmup prompts found")
+		return nil
+	}
+
+	wLogger.Infow("Loaded warmup prompts", "count", len(warmupPrompts))
+
+	// 发送预热请求
+	successCount := 0
+	totalCount := len(warmupPrompts)
+	wg := sync.WaitGroup{}
+	var successMutex sync.Mutex // 添加互斥锁保护successCount
+
+	for i, prompt := range warmupPrompts {
+		wg.Add(1)
+		go func(i int, prompt WarmupPrompt) {
+			defer wg.Done()
+			// 构建请求payload
+			payload := map[string]interface{}{
+				"model": "default",
+				"messages": []map[string]interface{}{
+					{
+						"role":    "user",
+						"content": prompt.Prompt,
+					},
+				},
+				"max_tokens":  prompt.MaxTokens,
+				"temperature": prompt.Temperature,
+				"stream":      false,
+			}
+
+			// 发送请求
+			startTime := time.Now()
+			resp, err := PostRequest(fmt.Sprintf("%s/v1/chat/completions", serverURL), payload)
+			duration := time.Since(startTime)
+
+			if err != nil {
+				wLogger.Errorw("Warmup request failed", "index", i+1, "error", err, "prompt", prompt.Prompt)
+			} else {
+				// 使用互斥锁保护successCount的更新
+				successMutex.Lock()
+				successCount++
+				successMutex.Unlock()
+				wLogger.Infow("Warmup request successful", "index", i+1, "duration", duration, "response_length", len(resp))
+			}
+		}(i, prompt)
+	}
+	wg.Wait()
+
+	successRate := float64(successCount) / float64(totalCount)
+	wLogger.Infow("Warmup completed", "success_count", successCount, "total_count", totalCount, "success_rate", successRate)
+
+	if successRate < 0.8 {
+		wLogger.Errorw("Warmup success rate too low", "success_rate", successRate)
+		return fmt.Errorf("warmup success rate too low: %.2f", successRate)
+	}
+
+	return nil
+}
+
+// PostRequest 发送POST请求（使用默认参数）
+func PostRequest(url string, jsonData map[string]interface{}) ([]byte, error) {
+	return PostRequestWithOptions(url, jsonData, nil, 3, 10*time.Second)
+}
+
+// PostRequestWithOptions 发送POST请求（自定义参数）
+func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers map[string]string, maxRetries int, timeout time.Duration) ([]byte, error) {
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: timeout,
+	}
+
+	// 准备请求体
+	var requestBody []byte
+	var err error
+
+	if jsonData != nil {
+		requestBody, err = json.Marshal(jsonData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal json data: %v", err)
+		}
+	}
+
+	// 创建请求
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// 设置默认Content-Type
+	if jsonData != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// 设置自定义headers
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	// 重试机制
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			wLogger.Debugw("Retrying POST request", "attempt", attempt, "url", url)
+			time.Sleep(1 * time.Second)
+		}
+
+		// 发送请求
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request failed (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// 读取响应
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// 检查HTTP状态码
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			wLogger.Debugw("POST request successful", "url", url, "status", resp.StatusCode)
+			return body, nil
+		}
+
+		// 如果不是成功状态码，记录错误但继续重试
+		lastErr = fmt.Errorf("HTTP error (attempt %d): %s - %s", attempt+1, resp.Status, string(body))
+
+		// 如果是4xx错误，不重试
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			wLogger.Warnw("Client error, not retrying", "status", resp.StatusCode, "body", string(body))
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("all retry attempts failed. Last error: %v", lastErr)
 }
