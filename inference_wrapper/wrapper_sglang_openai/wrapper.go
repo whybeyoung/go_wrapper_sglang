@@ -54,7 +54,7 @@ const (
 	R1_THINK_START                  = "<think>"
 	R1_THINK_END                    = "</think>"
 	HTTP_SERVER_REQUEST_TIMEOUT     = time.Second * 10
-	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 30
+	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 60
 	STREAM_CONNECT_TIMEOUT          = "stream connect timeout"
 	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
 	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
@@ -371,8 +371,17 @@ func waitServerReady(serverURL string) error {
 	httpClient := http.Client{
 		Timeout: HTTP_SERVER_REQUEST_TIMEOUT,
 	}
+
 	maxRetries := 0
 	timeInerval := time.Second // 请求间隔
+	waitTime := func() {
+		time.Sleep(timeInerval)
+		timeInerval = timeInerval * 2 // 每次重试增加间隔
+		if timeInerval > time.Minute {
+			timeInerval = time.Minute
+		}
+		maxRetries++
+	}
 	for i := 0; timeInerval < HTTP_SERVER_MAX_RETRY_TIME; i++ {
 		resp, err := httpClient.Get(serverURL)
 		wLogger.Debugw("Server resp", "resp", resp, "err", err)
@@ -381,24 +390,18 @@ func waitServerReady(serverURL string) error {
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 			healthStatus := Health{}
 			err = json.Unmarshal(body, &healthStatus)
 			if err != nil {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 			wLogger.Debugw("Server resp body", "body", healthStatus)
 			if healthStatus.Status != HealthStatusUp {
-				time.Sleep(timeInerval)
-				timeInerval *= 2 // 每次重试增加间隔
-				maxRetries++
+				waitTime()
 				continue
 			}
 
@@ -412,9 +415,7 @@ func waitServerReady(serverURL string) error {
 		}
 
 		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		time.Sleep(timeInerval)
-		timeInerval *= 2 // 每次重试增加间隔
-		maxRetries++
+		waitTime()
 	}
 	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
 }
@@ -468,22 +469,33 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	return unsafe.Pointer(inst), nil
 }
 
+// 定义结构体替代 map
+type ResponseContent struct {
+	Choices      []ResponseChoice `json:"choices"`
+	QuestionType string           `json:"question_type"`
+}
+
+type ResponseChoice struct {
+	Content          string                `json:"content"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	Index            int                   `json:"index"`
+	Role             string                `json:"role"`
+	FunctionCall     []openai.FunctionCall `json:"function_call,omitempty"`
+}
+
 func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall) (comwrapper.WrapperData, error) {
 
-	choice := map[string]interface{}{
-		"content":           text,
-		"reasoning_content": resoning_content,
-		"index":             0,
-		"role":              "assistant",
-	}
-	if len(function_call) > 0 {
-		choice["function_call"] = function_call
-	}
-	result := map[string]interface{}{
-		"choices": []map[string]interface{}{
-			choice,
+	result := ResponseContent{
+		Choices: []ResponseChoice{
+			{
+				Content:          text,
+				ReasoningContent: resoning_content,
+				Index:            0,
+				Role:             "assistant",
+				FunctionCall:     function_call, // 直接赋值，空切片会自动被 omitempty 忽略
+			},
 		},
-		"question_type": "",
+		QuestionType: "",
 	}
 	data, err := json.Marshal(result)
 
@@ -498,11 +510,11 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 }
 
 func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token int) (comwrapper.WrapperData, error) {
-	result := map[string]interface{}{
-		"prompt_tokens":     prompt_token,
-		"completion_tokens": completion_token,
-		"total_tokens":      prompt_token + completion_token,
-		"question_tokens":   4, // 无意义，未使用默认值4
+	result := Usage{
+		PromptTokens:     prompt_token,
+		CompletionTokens: completion_token,
+		TotalTokens:      prompt_token + completion_token,
+		QuestionTokens:   4,
 	}
 	data, err := json.Marshal(result)
 
@@ -846,7 +858,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					return
 				default:
 					// 创建响应数据切片
-					responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
+					responseData := make([]comwrapper.WrapperData, 1) // 预分配容量为1
 
 					response, err := stream.Recv()
 					if err != nil {
@@ -889,7 +901,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								return
 							}
 							fullContent += reasoning_last_chunk
-							responseData = append(responseData, reasoning_last_chunk_content)
+							responseData[0] = reasoning_last_chunk_content
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 								wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
 								return
@@ -927,7 +939,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 								return
 							}
 						}
-						responseData = append(responseData, content)
+						responseData[0] = content
 						fullContent += chunk_content
 						wLogger.Debugf("WrapperWrite stream response think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, chunk_content, inst.sid)
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
@@ -1274,6 +1286,7 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	QuestionTokens   int `json:"question_tokens"`
 }
 
 // monitorSubprocess 监控子进程
