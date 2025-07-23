@@ -33,29 +33,33 @@ var (
 	wLogger *utils.Logger
 	zLogger *utils.Logger
 
-	logLevel                    = "debug"
-	logCount                    = 10
-	logSize                     = 100
-	logAsync                    = true
-	logPath                     = "/log/app/wrapper.log"
-	zmqLogPath                  = "/log/app/zmqReceiver.log"
-	respKey                     = "content"
-	sessionManager              *SessionManager
-	requestManager              *RequestManager
-	httpServerPort              int
-	metricsAutoReport           bool               // 添加全局变量存储是否自动上报指标
-	isDecodeMode                bool               // 添加全局变量存储PD模式
-	promptSearchTemplate        string             // 添加全局变量存储搜索模板
-	promptSearchTemplateNoIndex string             // 添加全局变量存储不带索引的搜索模板
-	dataChanBufferSize          = 1024 * 64        // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
-	timeDDL                     = 60 * time.Minute // 超时时间
-	traceFunc                   func(usrTag string, key string, value string) (code int)
-	meterFunc                   func(usrTag string, key string, count int) (code int)
-	LbExtraFunc                 func(params map[string]string) error
-	throughputMax               float64
-	isGoRecvTokenizer           bool = true // 是否是 Go Recv Tokenizer 模式
-	serviceName                 string
+	logLevel                      = "debug"
+	logCount                      = 10
+	logSize                       = 100
+	logAsync                      = true
+	logPath                       = "/log/app/wrapper.log"
+	zmqLogPath                    = "/log/app/zmqReceiver.log"
+	respKey                       = "content"
+	sessionManager                *SessionManager
+	requestManager                *RequestManager
+	httpServerPort                int
+	metricsAutoReport             bool               // 添加全局变量存储是否自动上报指标
+	isDecodeMode                  bool               // 添加全局变量存储PD模式
+	promptSearchTemplate          string             // 添加全局变量存储搜索模板
+	promptSearchTemplateNoIndex   string             // 添加全局变量存储不带索引的搜索模板
+	dataChanBufferSize            = 1024 * 64        // 数据通道缓冲区大小，设置为1024以容纳约128KB的数据
+	timeDDL                       = 60 * time.Minute // 超时时间
+	traceFunc                     func(usrTag string, key string, value string) (code int)
+	meterFunc                     func(usrTag string, key string, count int) (code int)
+	LbExtraFunc                   func(params map[string]string) error
+	throughputMax                 float64
+	isGoRecvTokenizer             bool = true // 是否是 Go Recv Tokenizer 模式
+	enableJsonModeSysPromptInject bool = true // 是否注入json模式系统提示
+	enableJsonModePostProcess     bool = true // 是否进行json模式后处理
+	serviceName                   string
 )
+
+const JSONMODE_SYS_PROMPT = ` "请生成纯JSON，不要加 json, 还有三反引号或其他 Markdown 标记"`
 
 const (
 	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
@@ -99,19 +103,6 @@ type SingleStrOut struct {
 	CompletionTokens int                    `msgpack:"completion_tokens"`
 	CachedTokens     int                    `msgpack:"cached_tokens"`
 	SpecVerifyCt     int                    `msgpack:"spec_verify_ct"`
-	// InputTokenLogprobsVal     float64                `msgpack:"input_token_logprobs_val"`
-	// InputTokenLogprobsIdx     int                    `msgpack:"input_token_logprobs_idx"`
-	// OutputTokenLogprobsVal    float64                `msgpack:"output_token_logprobs_val"`
-	// OutputTokenLogprobsIdx    int                    `msgpack:"output_token_logprobs_idx"`
-	// InputTopLogprobsVal       []interface{}          `msgpack:"input_top_logprobs_val"`
-	// InputTopLogprobsIdx       []interface{}          `msgpack:"input_top_logprobs_idx"`
-	// OutputTopLogprobsVal      []interface{}          `msgpack:"output_top_logprobs_val"`
-	// OutputTopLogprobsIdx      []interface{}          `msgpack:"output_top_logprobs_idx"`
-	// InputTokenIdsLogprobsVal  []interface{}          `msgpack:"input_token_ids_logprobs_val"`
-	// InputTokenIdsLogprobsIdx  []interface{}          `msgpack:"input_token_ids_logprobs_idx"`
-	// OutputTokenIdsLogprobsVal []interface{}          `msgpack:"output_token_ids_logprobs_val"`
-	// OutputTokenIdsLogprobsIdx []interface{}          `msgpack:"output_token_ids_logprobs_idx"`
-	// OutputHiddenStates        []float64              `msgpack:"output_hidden_states"`
 }
 
 // wrapperInst 结构体定义
@@ -168,19 +159,6 @@ type BatchStrOut struct {
 	CompletionTokens []int                    `msgpack:"completion_tokens"`
 	CachedTokens     []int                    `msgpack:"cached_tokens"`
 	SpecVerifyCt     []int                    `msgpack:"spec_verify_ct"`
-	// InputTokenLogprobsVal     []float64                `msgpack:"input_token_logprobs_val"`
-	// InputTokenLogprobsIdx     []int                    `msgpack:"input_token_logprobs_idx"`
-	// OutputTokenLogprobsVal    []float64                `msgpack:"output_token_logprobs_val"`
-	// OutputTokenLogprobsIdx    []int                    `msgpack:"output_token_logprobs_idx"`
-	// InputTopLogprobsVal       [][]interface{}          `msgpack:"input_top_logprobs_val"`
-	// InputTopLogprobsIdx       [][]interface{}          `msgpack:"input_top_logprobs_idx"`
-	// OutputTopLogprobsVal      [][]interface{}          `msgpack:"output_top_logprobs_val"`
-	// OutputTopLogprobsIdx      [][]interface{}          `msgpack:"output_top_logprobs_idx"`
-	// InputTokenIdsLogprobsVal  [][]interface{}          `msgpack:"input_token_ids_logprobs_val"`
-	// InputTokenIdsLogprobsIdx  [][]interface{}          `msgpack:"input_token_ids_logprobs_idx"`
-	// OutputTokenIdsLogprobsVal [][]interface{}          `msgpack:"output_token_ids_logprobs_val"`
-	// OutputTokenIdsLogprobsIdx [][]interface{}          `msgpack:"output_token_ids_logprobs_idx"`
-	// OutputHiddenStates        [][]float64              `msgpack:"output_hidden_states"`
 }
 
 // metrics for lb
@@ -590,6 +568,22 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 从环境变量获取配置
 	baseModel := os.Getenv("FULL_MODEL_PATH")
+	// 获取json模式系统提示
+	jsonModeSysPromptInject := os.Getenv("JSON_MODE_SYS_PROMPT_INJECT")
+	jsonmodePostProcess := os.Getenv("JSON_MODE_POST_PROCESS")
+
+	if jsonModeSysPromptInject == "false" {
+		enableJsonModeSysPromptInject = false
+		wLogger.Infow("JsonMode Sys Inject is disabled")
+	} else {
+		wLogger.Infow("JsonMode Sys Inject is enabled")
+	}
+	if jsonmodePostProcess == "false" {
+		enableJsonModePostProcess = false
+		wLogger.Infow("JsonMode Post Process is disabled")
+	} else {
+		wLogger.Infow("JsonMode Post Process is enabled")
+	}
 
 	// 获取端口配置
 	port := os.Getenv("HTTP_SERVER_PORT")
@@ -868,6 +862,8 @@ func (inst *wrapperInst) handleRidResponse() {
 	var finished bool = false
 	var ttft time.Duration
 
+	var hasFoundJsonTokenStart bool = false
+
 	defer inst.abortRequest(inst.sid)
 
 	for {
@@ -895,14 +891,31 @@ func (inst *wrapperInst) handleRidResponse() {
 				if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
 					wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
 				} else {
-					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft)
+					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", singleOut.OutputStr)
 				}
 				// preifll 第一帧就结束 并发送释放信号
 				inst.active = false
 				return
 			} else if chunkIndex == 0 && !inst.SessionManager.IsPrefillMode() {
 				// 非 prefill 模式 仅记录ttft
-				wLogger.Infow("Decode Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft)
+				wLogger.Infow("Decode Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", singleOut.OutputStr)
+				// 特殊处理 JsonMode首字 不合法
+				if inst.jsonMode && !hasFoundJsonTokenStart && enableJsonModePostProcess {
+					// 查找 { 的位置
+					braceIndex := strings.Index(singleOut.OutputStr, "{")
+					if braceIndex >= 0 {
+						// 如果找到了 {，保留从 { 开始到结尾的所有内容
+						hasFoundJsonTokenStart = true
+						originalStr := singleOut.OutputStr
+						singleOut.OutputStr = singleOut.OutputStr[braceIndex:]
+						wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - found brace", "sid", inst.sid, "originalStr", originalStr, "convertedStr", singleOut.OutputStr)
+					} else {
+						// 如果没有找到 {，则全部去除
+						originalStr := singleOut.OutputStr
+						singleOut.OutputStr = ""
+						wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - no brace found", "sid", inst.sid, "originalStr", originalStr, "convertedStr", singleOut.OutputStr)
+					}
+				}
 			}
 
 			// 累加 token 数量
@@ -1229,6 +1242,39 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		formatResult := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 		messages := convertToOpenAIMessages(formatResult.Messages)
 		functions := formatResult.Functions
+
+		if inst.jsonMode && enableJsonModeSysPromptInject {
+			if len(messages) > 0 {
+				// 从后往前找到最新的一条 role 为 "user" 的消息
+				lastUserIndex := -1
+				for i := len(messages) - 1; i >= 0; i-- {
+					if messages[i].Role == "user" {
+						lastUserIndex = i
+						break
+					}
+				}
+
+				// 如果找到了 user 消息，在它前面插入 system 消息
+				if lastUserIndex >= 0 {
+					// 检查前一条消息是否已经是 system 消息，避免重复添加
+					needInsert := true
+					if lastUserIndex > 0 && messages[lastUserIndex-1].Role == "system" {
+						needInsert = false
+					}
+
+					if needInsert {
+						// 在 lastUserIndex 位置插入 system 消息
+						newMessage := openai.ChatCompletionMessage{
+							Role:    "system",
+							Content: JSONMODE_SYS_PROMPT,
+						}
+
+						// 创建新的切片，在指定位置插入元素
+						messages = append(messages[:lastUserIndex], append([]openai.ChatCompletionMessage{newMessage}, messages[lastUserIndex:]...)...)
+					}
+				}
+			}
+		}
 
 		if os.Getenv("IS_REASONING_MODEL") == "true" {
 			if len(messages) > 0 {
