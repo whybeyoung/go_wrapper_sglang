@@ -237,6 +237,31 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if len(toolCallParser) > 0 {
 		extraArgs += fmt.Sprintf(" --tool-call-parser %v ", toolCallParser)
 	}
+	// 检查多节点模式
+	enableMultiNode := os.Getenv("ENABLE_MULTI_NODE_MODE")
+	if enableMultiNode == "true" {
+		wLogger.Infow("Multi-node mode enabled")
+
+		// 获取组大小
+		if groupSize := os.Getenv("LWS_GROUP_SIZE"); groupSize != "" {
+			extraArgs += fmt.Sprintf(" --nnodes %s", groupSize)
+		}
+
+		// 获取leader地址
+		if leaderAddr := os.Getenv("LWS_LEADER_ADDRESS"); leaderAddr != "" {
+
+			distPort := os.Getenv("DIST_PORT")
+			if distPort == "" {
+				distPort = "20000"
+			}
+			extraArgs += fmt.Sprintf(" --dist-init-addr %s:%s", leaderAddr, distPort)
+		}
+
+		// 获取worker索引
+		if workerIndex := os.Getenv("LWS_WORKER_INDEX"); workerIndex != "" {
+			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
+		}
+	}
 
 	pretrainedName = os.Getenv("PRETRAINED_MODEL_NAME")
 	finetuneType = os.Getenv("FINETUNE_TYPE")
