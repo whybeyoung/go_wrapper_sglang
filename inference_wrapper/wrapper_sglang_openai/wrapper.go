@@ -393,50 +393,17 @@ func reportSglangMetrics(serverMetricURL string) {
 	}
 }
 
-const (
-	HealthStatusUp string = "Up"
-)
-
-type Health struct {
-	Status string
-}
-
 // waitServerReady 等待服务器就绪
 func waitServerReady(serverURL string) error {
 	httpClient := http.Client{
 		Timeout: HTTP_SERVER_REQUEST_TIMEOUT,
 	}
-	maxRetries := 0
-	var timeInerval time.Duration // 请求间隔
+	retries := 0
 	timeBegin := time.Now()
-	waitTime := func() {
-		time.Sleep(5 * time.Second)
-		timeInerval = time.Now().Sub(timeBegin)
-		maxRetries++
-	}
-	for i := 0; timeInerval < HTTP_SERVER_MAX_RETRY_TIME; i++ {
+	for {
 		resp, err := httpClient.Get(serverURL)
 		wLogger.Debugw("Server resp", "resp", resp, "err", err)
 		if err == nil && resp.StatusCode == http.StatusOK {
-			// 读取响应
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				waitTime()
-				continue
-			}
-			healthStatus := Health{}
-			err = json.Unmarshal(body, &healthStatus)
-			if err != nil {
-				waitTime()
-				continue
-			}
-			wLogger.Debugw("Server resp body", "body", healthStatus)
-			if healthStatus.Status != HealthStatusUp {
-				waitTime()
-				continue
-			}
-
 			wLogger.Debugw("Server ready", "url", serverURL)
 			return nil
 		}
@@ -445,10 +412,16 @@ func waitServerReady(serverURL string) error {
 			resp.Body.Close()
 		}
 
-		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
-		waitTime()
+		retries++
+		timeInerval := time.Since(timeBegin)
+		if timeInerval >= HTTP_SERVER_MAX_RETRY_TIME {
+			break
+		}
+
+		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", retries)
+		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
+	return fmt.Errorf("server failed to start after %d attempts", retries)
 }
 
 // getLocalIP 获取本地IP
