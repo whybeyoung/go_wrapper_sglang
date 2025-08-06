@@ -70,6 +70,9 @@ var LbExtraFunc func(params map[string]string) error
 const (
 	R1_THINK_START                  = "<think>"
 	R1_THINK_END                    = "</think>"
+	GPT_THINK_START                 = "analysis"
+	GPT_THINK_END_ASSISTANT         = "assistant"
+	GPT_THINK_END_FINAL             = "final"
 	HTTP_SERVER_REQUEST_TIMEOUT     = time.Second * 10
 	HTTP_SERVER_MAX_RETRY_TIME      = time.Minute * 60
 	STREAM_CONNECT_TIMEOUT          = "stream connect timeout"
@@ -841,6 +844,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 			index := 0
 			fullContent := ""
+			pre_chunk_content := ""
 
 			status = comwrapper.DataContinue
 			// 首帧返回空
@@ -892,7 +896,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
 						var content comwrapper.WrapperData
 						chunk_content := response.Choices[0].Delta.Content
-						if chunk_content == R1_THINK_START {
+						if chunk_content == R1_THINK_START || (chunk_content == GPT_THINK_START && index == 1) {
 							thinking = true
 							continue
 						}
@@ -933,6 +937,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							index += 1
 							continue
 						}
+						if chunk_content == GPT_THINK_END_FINAL && pre_chunk_content == GPT_THINK_END_ASSISTANT && thinking {
+							thinking = false
+							continue
+						}
+						pre_chunk_content = chunk_content
 
 						if thinking {
 							content, err = responseContent(status, index, "", chunk_content, nil)
