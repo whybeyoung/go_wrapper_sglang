@@ -61,6 +61,7 @@ var (
 	globalEnableThinking   = true
 	loadLoraAdapter        = "load_lora_adapter"
 	unloadLoraAdapter      = "unload_lora_adapter"
+	reasoningEffort        = "high"
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -200,6 +201,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 	isReasoningModelStr := os.Getenv("IS_REASONING_MODEL")
 	if isReasoningModelStr == "true" {
 		isReasoningModel = true
+	}
+
+	reasoningEffortStr := os.Getenv("REASONING_EFFORT")
+	if reasoningEffortStr != "" {
+		reasoningEffort = reasoningEffortStr
 	}
 
 	// 获取端口配置
@@ -584,7 +590,8 @@ type ExtraParams struct {
 			Strict      bool                   `json:"strict"`
 		} `json:"json_schema,omitempty"`
 	} `json:"response_format,omitempty"`
-	LogitBias map[string]int `json:"logit_bias,omitempty"`
+	LogitBias       map[string]int `json:"logit_bias,omitempty"`
+	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 }
 
 func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, req *openai.ChatCompletionRequest) error {
@@ -752,6 +759,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if err := json.Unmarshal([]byte(extra_parms), &extraParams); err != nil {
 			wLogger.Errorw("WrapperWrite unmarshal extra_parms error", "error", err, "sid", inst.sid, "extra_parms", extra_parms)
 		}
+		if extraParams.ReasoningEffort != "" {
+			streamReq.ExtraBody["reasoning_effort"] = extraParams.ReasoningEffort
+		} else {
+			streamReq.ExtraBody["reasoning_effort"] = reasoningEffort
+		}
 		// 解析 extra_parms 的 response_format string 反序列化 ChatCompletionResponseFormat格式
 		var responseFormat openai.ChatCompletionResponseFormat
 		if extraParams.ResponseFormat != nil {
@@ -844,7 +856,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 			index := 0
 			fullContent := ""
-			pre_chunk_content := ""
+			// pre_chunk_content := ""
 
 			status = comwrapper.DataContinue
 			// 首帧返回空
@@ -891,12 +903,26 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						responseError(inst, err)
 						return
 					}
-
+					if len(response.Choices) > 0 && response.Choices[0].Delta.ReasoningContent != "" {
+						chunk_content := response.Choices[0].Delta.ReasoningContent
+						wLogger.Debugf("WrapperWrite stream response reasoning index:%v, status:%v, chunk_content:%v, sid:%v\n", index, status, chunk_content, inst.sid)
+						content, err := responseContent(status, index, "", chunk_content, nil)
+						if err != nil {
+							wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
+							responseError(inst, err)
+							return
+						}
+						if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{content}, nil); err != nil {
+							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+							return
+						}
+						index += 1
+					}
 					// 处理content数据
 					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
 						var content comwrapper.WrapperData
 						chunk_content := response.Choices[0].Delta.Content
-						if chunk_content == R1_THINK_START || (chunk_content == GPT_THINK_START && index == 1) {
+						if chunk_content == R1_THINK_START {
 							thinking = true
 							continue
 						}
@@ -937,11 +963,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							index += 1
 							continue
 						}
-						if chunk_content == GPT_THINK_END_FINAL && pre_chunk_content == GPT_THINK_END_ASSISTANT && thinking {
-							thinking = false
-							continue
-						}
-						pre_chunk_content = chunk_content
+						// if chunk_content == GPT_THINK_END_FINAL && pre_chunk_content == GPT_THINK_END_ASSISTANT && thinking {
+						// 	thinking = false
+						// 	continue
+						// }
+						// pre_chunk_content = chunk_content
 
 						if thinking {
 							content, err = responseContent(status, index, "", chunk_content, nil)
