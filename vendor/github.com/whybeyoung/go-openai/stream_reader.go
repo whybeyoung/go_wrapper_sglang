@@ -38,6 +38,7 @@ func (stream *streamReader[T]) Recv() (response T, err error) {
 	}
 
 	response, err = stream.processLines()
+	fmt.Println("response", response, "err", err)
 	return
 }
 
@@ -52,6 +53,7 @@ func (stream *streamReader[T]) processLines() (T, error) {
 		rawLine, readErr := stream.reader.ReadBytes('\n')
 		if readErr != nil || hasErrorPrefix {
 			respErr := stream.unmarshalError()
+			fmt.Println("respErr", respErr, "readErr", readErr, "rawLine", string(rawLine))
 			if respErr != nil {
 				return *new(T), fmt.Errorf("error, %w", respErr.Error)
 			}
@@ -68,6 +70,7 @@ func (stream *streamReader[T]) processLines() (T, error) {
 			}
 			writeErr := stream.errAccumulator.Write(noSpaceLine)
 			if writeErr != nil {
+				fmt.Println("writeErr", writeErr)
 				return *new(T), writeErr
 			}
 			emptyMessagesCount++
@@ -87,6 +90,7 @@ func (stream *streamReader[T]) processLines() (T, error) {
 		var response T
 		unmarshalErr := stream.unmarshaler.Unmarshal(noPrefixLine, &response)
 		if unmarshalErr != nil {
+			fmt.Println("unmarshalErr", unmarshalErr, "noPrefixLine", string(noPrefixLine))
 			return *new(T), unmarshalErr
 		}
 

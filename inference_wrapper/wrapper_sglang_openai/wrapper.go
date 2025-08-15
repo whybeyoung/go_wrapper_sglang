@@ -45,7 +45,7 @@ var (
 	httpServerPort              = 40000
 	streamContextTimeoutSeconds = 1800 * time.Second
 	temperature                 = 0.95
-	maxTokens                   = 2048
+	maxTokens                   = 0
 	topP                        = 0.95
 	promptSearchTemplate        string // 添加全局变量存储搜索模板
 	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
@@ -604,7 +604,7 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 	}
 	req.Tools = openaiTools
 	req.ToolChoice = "auto"
-	//req.Stream = false
+	req.Stream = false
 	// req := openai.ChatCompletionRequest{
 	// 	Model:      "default",
 	// 	Messages:   convertToOpenAIMessages(openaiMsgs),
@@ -655,6 +655,137 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 	}
 	return nil
 }
+func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.ChatCompletionRequest, []openai.FunctionDefinition, bool) {
+	// 从params中获取参数, 否则使用默认值
+	temp := temperature
+	mt := maxTokens
+	tp := topP
+	if tempStr, ok := inst.params["temperature"]; ok {
+		if t, err := strconv.ParseFloat(tempStr, 64); err == nil {
+			temp = t
+		} else {
+			wLogger.Warnw("Invalid temperature value", "value", tempStr, "sid", inst.sid)
+		}
+	}
+
+	if tokens, ok := inst.params["max_tokens"]; ok {
+		if t, err := strconv.Atoi(tokens); err == nil {
+			mt = t
+		} else {
+			wLogger.Warnw("Invalid max_tokens value", "value", tokens, "sid", inst.sid)
+		}
+	}
+
+	if tpStr, ok := inst.params["top_p"]; ok {
+		if t, err := strconv.ParseFloat(tpStr, 32); err == nil {
+			tp = t
+		} else {
+			wLogger.Warnw("Invalid top_p value", "value", tpStr, "sid", inst.sid)
+		}
+	}
+
+	modelName := DEFAULT_MODEL_NAME
+	lora_path := ""
+	if finetuneType == "lora" || finetuneType == "qlora" {
+		if patch_id, ok := inst.params["patch_id"]; ok && patch_id != "" {
+			patchIdMapMutex.RLock()
+			if lora_path, ok = patchIdInnerPatchIdMap[patch_id]; ok {
+				lora_path = patch_id
+			} else {
+				wLogger.Errorw("lora or qlora infer, but lora path is invalid ", "patch_id", patch_id, "sid", inst.sid)
+			}
+			patchIdMapMutex.RUnlock()
+
+		}
+	}
+	streamReq := &openai.ChatCompletionRequest{
+		Model: modelName,
+	}
+	enableThinking := globalEnableThinking
+
+	if enable_thinking, ok := inst.params["enable_thinking"]; ok {
+		if enable_thinking == "false" {
+			enableThinking = false
+		} else {
+			enableThinking = true
+		}
+	}
+	streamReq.ExtraBody = map[string]any{
+		"chat_template_kwargs": map[string]interface{}{
+			"enable_thinking": enableThinking,
+		},
+	}
+	if lora_path != "" {
+		// enable_thinking 为true有效果
+		streamReq.ExtraBody["lora_path"] = lora_path
+	}
+	// 从params中获取 extra_body
+	extra_parms := ""
+	if v, ok := inst.params["extra_body"]; ok {
+		extra_parms = v
+	}
+	// 解析 extra_parms
+	var extraParams ExtraParams
+	if err := json.Unmarshal([]byte(extra_parms), &extraParams); err != nil {
+		wLogger.Errorw("WrapperWrite unmarshal extra_parms error", "error", err, "sid", inst.sid, "extra_parms", extra_parms)
+	}
+	if extraParams.ReasoningEffort != "" {
+		streamReq.ExtraBody["reasoning_effort"] = extraParams.ReasoningEffort
+	} else {
+		streamReq.ExtraBody["reasoning_effort"] = reasoningEffort
+	}
+	// 解析 extra_parms 的 response_format string 反序列化 ChatCompletionResponseFormat格式
+	var responseFormat openai.ChatCompletionResponseFormat
+	if extraParams.ResponseFormat != nil {
+		responseFormat.Type = openai.ChatCompletionResponseFormatType(extraParams.ResponseFormat.Type)
+		if extraParams.ResponseFormat.JSONSchema != nil {
+			// 将 schema 转换为 json.RawMessage
+			schemaBytes, err := json.Marshal(extraParams.ResponseFormat.JSONSchema.Schema)
+			if err != nil {
+				wLogger.Errorw("WrapperWrite marshal schema error", "error", err, "sid", inst.sid)
+			} else {
+				// 创建一个自定义的 Marshaler 类型
+				responseFormat.JSONSchema = &openai.ChatCompletionResponseFormatJSONSchema{
+					Name:        extraParams.ResponseFormat.JSONSchema.Name,
+					Description: extraParams.ResponseFormat.JSONSchema.Description,
+					Schema:      schemaMarshaler{data: schemaBytes},
+					Strict:      extraParams.ResponseFormat.JSONSchema.Strict,
+				}
+			}
+		}
+	}
+	if responseFormat.Type != "" {
+		streamReq.ResponseFormat = &responseFormat
+	}
+	wLogger.Infow("WrapperWrite request parameters",
+		"sid", inst.sid,
+		"temperature", temp,
+		"maxTokens", mt,
+		"topP", tp)
+	if mt > 0 {
+		streamReq.MaxTokens = mt
+	}
+	streamReq.Temperature = float32(temp)
+	streamReq.Stream = true
+	streamReq.StreamOptions = &openai.StreamOptions{
+		IncludeUsage: true,
+	}
+	streamReq.TopP = float32(tp)
+	openaiMsgs, functions := formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
+	thinking := false
+	if isReasoningModel {
+		lastMsg := openaiMsgs[len(openaiMsgs)-1]
+		if lastMsg.Role != "assistant" {
+			openaiMsgs = append(openaiMsgs, Message{
+				Role:    "assistant",
+				Content: R1_THINK_START + "\n",
+			})
+			thinking = true
+		}
+	}
+	return streamReq, functions, thinking
+}
 
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
@@ -689,137 +820,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		wLogger.Debugw("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
 
-		// 从params中获取参数, 否则使用默认值
-		if temp, ok := inst.params["temperature"]; ok {
-			if t, err := strconv.ParseFloat(temp, 64); err == nil {
-				temperature = t
-			} else {
-				wLogger.Warnw("Invalid temperature value", "value", temp, "sid", inst.sid)
-			}
-		}
+		streamReq, functions, thinking := buildStreamReq(inst, v)
 
-		if tokens, ok := inst.params["max_tokens"]; ok {
-			if t, err := strconv.Atoi(tokens); err == nil {
-				maxTokens = t
-			} else {
-				wLogger.Warnw("Invalid max_tokens value", "value", tokens, "sid", inst.sid)
-			}
-		}
-
-		if tp, ok := inst.params["top_p"]; ok {
-			if t, err := strconv.ParseFloat(tp, 32); err == nil {
-				topP = t
-			} else {
-				wLogger.Warnw("Invalid top_p value", "value", tp, "sid", inst.sid)
-			}
-		}
-
-		modelName := DEFAULT_MODEL_NAME
-		lora_path := ""
-		if finetuneType == "lora" || finetuneType == "qlora" {
-			if patch_id, ok := inst.params["patch_id"]; ok && patch_id != "" {
-				patchIdMapMutex.RLock()
-				if lora_path, ok = patchIdInnerPatchIdMap[patch_id]; ok {
-					lora_path = patch_id
-				} else {
-					wLogger.Errorw("lora or qlora infer, but lora path is invalid ", "patch_id", patch_id, "sid", inst.sid)
-				}
-				patchIdMapMutex.RUnlock()
-
-			}
-		}
-		streamReq := &openai.ChatCompletionRequest{
-			Model: modelName,
-		}
-		enableThinking := globalEnableThinking
-
-		if enable_thinking, ok := inst.params["enable_thinking"]; ok {
-			if enable_thinking == "false" {
-				enableThinking = false
-			} else {
-				enableThinking = true
-			}
-		}
-		streamReq.ExtraBody = map[string]any{
-			"chat_template_kwargs": map[string]interface{}{
-				"enable_thinking": enableThinking,
-			},
-		}
-		if lora_path != "" {
-			// enable_thinking 为true有效果
-			streamReq.ExtraBody["lora_path"] = lora_path
-		}
-		// 从params中获取 extra_body
-		extra_parms := ""
-		if v, ok := inst.params["extra_body"]; ok {
-			extra_parms = v
-		}
-		// 解析 extra_parms
-		var extraParams ExtraParams
-		if err := json.Unmarshal([]byte(extra_parms), &extraParams); err != nil {
-			wLogger.Errorw("WrapperWrite unmarshal extra_parms error", "error", err, "sid", inst.sid, "extra_parms", extra_parms)
-		}
-		if extraParams.ReasoningEffort != "" {
-			streamReq.ExtraBody["reasoning_effort"] = extraParams.ReasoningEffort
-		} else {
-			streamReq.ExtraBody["reasoning_effort"] = reasoningEffort
-		}
-		// 解析 extra_parms 的 response_format string 反序列化 ChatCompletionResponseFormat格式
-		var responseFormat openai.ChatCompletionResponseFormat
-		if extraParams.ResponseFormat != nil {
-			responseFormat.Type = openai.ChatCompletionResponseFormatType(extraParams.ResponseFormat.Type)
-			if extraParams.ResponseFormat.JSONSchema != nil {
-				// 将 schema 转换为 json.RawMessage
-				schemaBytes, err := json.Marshal(extraParams.ResponseFormat.JSONSchema.Schema)
-				if err != nil {
-					wLogger.Errorw("WrapperWrite marshal schema error", "error", err, "sid", inst.sid)
-				} else {
-					// 创建一个自定义的 Marshaler 类型
-					responseFormat.JSONSchema = &openai.ChatCompletionResponseFormatJSONSchema{
-						Name:        extraParams.ResponseFormat.JSONSchema.Name,
-						Description: extraParams.ResponseFormat.JSONSchema.Description,
-						Schema:      schemaMarshaler{data: schemaBytes},
-						Strict:      extraParams.ResponseFormat.JSONSchema.Strict,
-					}
-				}
-			}
-		}
-		if responseFormat.Type != "" {
-			streamReq.ResponseFormat = &responseFormat
-		}
-		wLogger.Infow("WrapperWrite request parameters",
-			"sid", inst.sid,
-			"temperature", temperature,
-			"maxTokens", maxTokens,
-			"topP", topP)
-
-		promptTokensLen, resultTokensLen := 0, 0
-		openaiMsgs, functions := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
-		streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 		// 如果是fuction请求
 		if len(functions) > 0 {
 			return openaiFunctionCall(inst, functions, streamReq)
 		}
+		promptTokensLen, resultTokensLen := 0, 0
 
-		thinking := false
-		if isReasoningModel {
-			lastMsg := openaiMsgs[len(openaiMsgs)-1]
-			if lastMsg.Role != "assistant" {
-				openaiMsgs = append(openaiMsgs, Message{
-					Role:    "assistant",
-					Content: R1_THINK_START + "\n",
-				})
-				thinking = true
-			}
-		}
-
-		streamReq.Temperature = float32(temperature)
-		streamReq.MaxTokens = maxTokens
-		streamReq.Stream = true
-		streamReq.StreamOptions = &openai.StreamOptions{
-			IncludeUsage: true,
-		}
-		streamReq.TopP = float32(topP)
 		// 创建流式请求
 		// streamReq := &openai.ChatCompletionRequest{
 		// 	Model:       "default",
@@ -832,7 +840,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 	},
 		// 	TopP: float32(topP),
 		// }
-		wLogger.Debugf("WrapperWrite streamReq:%v, %v\n", toString(streamReq), inst.sid)
+		wLogger.Infof("WrapperWrite streamReq:%v, %v\n", toString(streamReq), inst.sid)
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
