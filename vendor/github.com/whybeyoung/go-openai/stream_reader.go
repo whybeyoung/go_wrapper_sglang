@@ -38,7 +38,6 @@ func (stream *streamReader[T]) Recv() (response T, err error) {
 	}
 
 	response, err = stream.processLines()
-	fmt.Println("response", response, "err", err)
 	return
 }
 

@@ -44,9 +44,9 @@ var (
 	requestManager              *RequestManager
 	httpServerPort              = 40000
 	streamContextTimeoutSeconds = 1800 * time.Second
-	temperature                 = 0.95
-	maxTokens                   = 0
-	topP                        = 0.95
+	// temperature                 = 0.95
+	// maxTokens                   = 0
+	// topP                        = 0.95
 	promptSearchTemplate        string // 添加全局变量存储搜索模板
 	promptSearchTemplateNoIndex string // 添加全局变量存储不带索引的搜索模板
 	finetuneType                = ""   // 添加全局变量存储finetune类型
@@ -239,6 +239,27 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
 		wLogger.Infow("Metrics enabled")
+	}
+	// 读取generation_config.json文件
+	preferredSamplingParams := os.Getenv("PREFERRED_SAMPLING_PARAMS")
+	if preferredSamplingParams != "" {
+		extraArgs += fmt.Sprintf(" --preferred-sampling-params %v ", preferredSamplingParams)
+	} else if baseModel != "" {
+		genConfig, err := readGenerationConfig(baseModel)
+		if err != nil {
+			wLogger.Warnw("Failed to read generation config", "error", err)
+		} else {
+			if len(genConfig) == 0 {
+				wLogger.Infow("Generation config is empty")
+			} else {
+				// 将配置信息转换为JSON并打印
+				configBytes, _ := json.Marshal(genConfig)
+				configStr := string(configBytes)
+				wLogger.Infow("Generation config loaded successfully",
+					"configStr", configStr)
+				extraArgs += fmt.Sprintf(" --preferred-sampling-params %v ", configStr)
+			}
+		}
 	}
 
 	// 检查是否启用tools
@@ -656,10 +677,12 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 	return nil
 }
 func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.ChatCompletionRequest, []openai.FunctionDefinition, bool) {
-	// 从params中获取参数, 否则使用默认值
-	temp := temperature
-	mt := maxTokens
-	tp := topP
+	// 从params中获取参数, 否则不传
+	var (
+		temp = float64(0)
+		mt   = 0
+		tp   = float64(0)
+	)
 	if tempStr, ok := inst.params["temperature"]; ok {
 		if t, err := strconv.ParseFloat(tempStr, 64); err == nil {
 			temp = t
@@ -683,8 +706,42 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			wLogger.Warnw("Invalid top_p value", "value", tpStr, "sid", inst.sid)
 		}
 	}
+	streamReq := &openai.ChatCompletionRequest{
+		Model: DEFAULT_MODEL_NAME,
+	}
+	wLogger.Infow("WrapperWrite request parameters",
+		"sid", inst.sid,
+		"temperature", temp,
+		"maxTokens", mt,
+		"topP", tp)
+	if mt > 0 {
+		streamReq.MaxTokens = mt
+	}
+	if temp > 0 {
+		streamReq.Temperature = float32(temp)
+	}
+	if tp > 0 {
+		streamReq.TopP = float32(tp)
+	}
+	streamReq.Stream = true
+	streamReq.StreamOptions = &openai.StreamOptions{
+		IncludeUsage: true,
+	}
 
-	modelName := DEFAULT_MODEL_NAME
+	enableThinking := globalEnableThinking
+	if enable_thinking, ok := inst.params["enable_thinking"]; ok {
+		if enable_thinking == "false" {
+			enableThinking = false
+		} else {
+			enableThinking = true
+		}
+	}
+	streamReq.ExtraBody = map[string]any{
+		"chat_template_kwargs": map[string]interface{}{
+			"enable_thinking": enableThinking,
+		},
+	}
+
 	lora_path := ""
 	if finetuneType == "lora" || finetuneType == "qlora" {
 		if patch_id, ok := inst.params["patch_id"]; ok && patch_id != "" {
@@ -697,23 +754,6 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			patchIdMapMutex.RUnlock()
 
 		}
-	}
-	streamReq := &openai.ChatCompletionRequest{
-		Model: modelName,
-	}
-	enableThinking := globalEnableThinking
-
-	if enable_thinking, ok := inst.params["enable_thinking"]; ok {
-		if enable_thinking == "false" {
-			enableThinking = false
-		} else {
-			enableThinking = true
-		}
-	}
-	streamReq.ExtraBody = map[string]any{
-		"chat_template_kwargs": map[string]interface{}{
-			"enable_thinking": enableThinking,
-		},
 	}
 	if lora_path != "" {
 		// enable_thinking 为true有效果
@@ -757,20 +797,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	if responseFormat.Type != "" {
 		streamReq.ResponseFormat = &responseFormat
 	}
-	wLogger.Infow("WrapperWrite request parameters",
-		"sid", inst.sid,
-		"temperature", temp,
-		"maxTokens", mt,
-		"topP", tp)
-	if mt > 0 {
-		streamReq.MaxTokens = mt
-	}
-	streamReq.Temperature = float32(temp)
-	streamReq.Stream = true
-	streamReq.StreamOptions = &openai.StreamOptions{
-		IncludeUsage: true,
-	}
-	streamReq.TopP = float32(tp)
+
 	openaiMsgs, functions := formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 	thinking := false
@@ -790,7 +817,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
 	inst := (*wrapperInst)(hdl)
-	wLogger.Debugf("WrapperWrite inst:%v, req:%v\n", toString(inst), toString(req))
+	wLogger.Infof("WrapperWrite inst:%v, req:%v\n", toString(inst), toString(req))
 	if !inst.active {
 		wLogger.Warnw("WrapperWrite called on inactive instance", "sid", inst.sid)
 		return fmt.Errorf("instance is not active")
@@ -925,9 +952,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							return
 						}
 						index += 1
-					}
-					// 处理content数据
-					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
+					} else if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
 						var content comwrapper.WrapperData
 						chunk_content := response.Choices[0].Delta.Content
 						if chunk_content == R1_THINK_START {
@@ -1000,10 +1025,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							return
 						}
 						index += 1
-					}
-
-					// 处理usage数据
-					if response.Usage != nil {
+					} else if response.Usage != nil {
 						// 创建usage数据结构
 						promptTokensLen = response.Usage.PromptTokens
 						resultTokensLen = response.Usage.CompletionTokens
@@ -1817,4 +1839,45 @@ func PostRequestWithOptions(url string, jsonData map[string]interface{}, headers
 	}
 
 	return nil, fmt.Errorf("all retry attempts failed. Last error: %v", lastErr)
+}
+
+// readGenerationConfig 读取generation_config.json文件
+func readGenerationConfig(baseModelPath string) (map[string]interface{}, error) {
+	if baseModelPath == "" {
+		return nil, fmt.Errorf("base model path is empty")
+	}
+
+	configPath := filepath.Join(baseModelPath, "generation_config.json")
+	fmt.Printf("Reading generation config from: %s\n", configPath)
+
+	// 检查文件是否存在
+	if _, err := os.Stat(configPath); err != nil {
+		return nil, fmt.Errorf("generation_config.json not found: %v", err)
+	}
+
+	// 读取文件内容
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read generation_config.json: %v", err)
+	}
+
+	// 解析JSON
+	var config map[string]interface{}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse generation_config.json: %v", err)
+	}
+
+	// 提取配置信息
+	genConfig := map[string]interface{}{}
+
+	if temp, exists := config["temperature"]; exists {
+		genConfig["temperature"] = temp
+		fmt.Printf("Temperature from config: %v\n", temp)
+	}
+
+	if topP, exists := config["top_p"]; exists {
+		genConfig["top_p"] = topP
+		fmt.Printf("Top_p from config: %v\n", topP)
+	}
+	return genConfig, nil
 }
