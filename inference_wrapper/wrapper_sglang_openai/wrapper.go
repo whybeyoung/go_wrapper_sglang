@@ -43,7 +43,7 @@ var (
 	respKey                     = "content"
 	requestManager              *RequestManager
 	httpServerPort              = 40000
-	streamContextTimeoutSeconds = 1800 * time.Second
+	streamContextTimeoutSeconds = 5400 * time.Second
 	// temperature                 = 0.95
 	// maxTokens                   = 0
 	// topP                        = 0.95
@@ -845,7 +845,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			continue // 跳过kv_info数据
 		}
 
-		wLogger.Debugw("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
+		wLogger.Infow("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
 
 		streamReq, functions, thinking := buildStreamReq(inst, v)
 
@@ -901,7 +901,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				responseError(inst, err)
 				return
 			}
-			wLogger.Debugf("fisrtFrameContent:%v index:%v,status:%v sid:%v\n", "", index, status, inst.sid)
+			wLogger.Infof("fisrtFrameContent:%v index:%v,status:%v sid:%v\n", "", index, status, inst.sid)
 			if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{firstFrameContent}, nil); err != nil {
 				wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
 				return
@@ -937,6 +937,9 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						}
 						responseError(inst, err)
 						return
+					}
+					if index == 1 {
+						wLogger.Infow("WrapperWrite content first frame content", toString(response))
 					}
 					if len(response.Choices) > 0 && response.Choices[0].Delta.ReasoningContent != "" {
 						chunk_content := response.Choices[0].Delta.ReasoningContent
