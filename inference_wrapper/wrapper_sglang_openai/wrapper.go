@@ -939,7 +939,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						return
 					}
 					if index == 1 {
-						wLogger.Infow("WrapperWrite content first frame content", toString(response))
+						wLogger.Infow("WrapperWrite content first frame content", "response", toString(response), "sid", inst.sid)
 					}
 					if len(response.Choices) > 0 && response.Choices[0].Delta.ReasoningContent != "" {
 						chunk_content := response.Choices[0].Delta.ReasoningContent
@@ -1563,7 +1563,7 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 	config := openai.DefaultConfig("maas")
 	config.BaseURL = baseURL
 	config.HTTPClient = &http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: streamContextTimeoutSeconds,
 		Transport: &http.Transport{
 			MaxIdleConns:        6000,
 			MaxIdleConnsPerHost: 3000,
