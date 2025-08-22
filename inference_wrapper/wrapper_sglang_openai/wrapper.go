@@ -186,7 +186,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if err != nil {
 		return fmt.Errorf("loggerErr:%v", err)
 	}
-	wLogger.Debugf("wrapper config:%v", cfg)
+	wLogger.Infof("wrapper config:%v", cfg)
 
 	// 获取搜索模板
 	if promptSearchTemplate != "" {
@@ -552,7 +552,7 @@ func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token 
 }
 
 func responseError(inst *wrapperInst, err error) {
-	wLogger.Debugf("WrapperWrite stream err:%v, sid:%v\n", err.Error(), inst.sid)
+	wLogger.Errorf("WrapperWrite stream err:%v, sid:%v\n", err.Error(), inst.sid)
 
 	if err = inst.callback(inst.usrTag, nil, err); err != nil {
 		wLogger.Errorw("WrapperWrite error callback failed", "error", err, "sid", inst.sid)
@@ -572,9 +572,9 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 		return err
 	}
 	responseData := []comwrapper.WrapperData{content, usageWrapperData}
-	wLogger.Debugf("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v, sid:%v\n", index, prompt_tokens_len, result_tokens_len, responseData, inst.sid)
+	wLogger.Infof("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v, sid:%v\n", index, prompt_tokens_len, result_tokens_len, responseData, inst.sid)
 	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-		wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+		wLogger.Errorw("WrapperWrite end callback error", "error", err, "sid", inst.sid)
 		return err
 	}
 	return nil
@@ -951,7 +951,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							return
 						}
 						if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{content}, nil); err != nil {
-							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+							wLogger.Errorw("WrapperWrite reasoning callback error", "error", err, "sid", inst.sid)
 							return
 						}
 						index += 1
@@ -979,7 +979,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							fullContent += reasoning_last_chunk
 							responseData = append(responseData, reasoning_last_chunk_content)
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-								wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+								wLogger.Errorw("WrapperWrite reasoning_last_chunk_content callback error", "error", err, "sid", inst.sid)
 								return
 							}
 							index += 1
@@ -993,7 +993,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, answer_start_chunk:%v, sid:%v\n", index, status, answer_start_chunk, inst.sid)
 							responseData[0] = answer_start_chunk_content
 							if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-								wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+								wLogger.Errorw("WrapperWrite answer_start_chunk_content callback error", "error", err, "sid", inst.sid)
 								return
 							}
 							index += 1
@@ -1024,7 +1024,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						fullContent += chunk_content
 						wLogger.Debugf("WrapperWrite stream response think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, chunk_content, inst.sid)
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-							wLogger.Errorw("WrapperWrite usage callback error", "error", err, "sid", inst.sid)
+							wLogger.Errorw("WrapperWrite content callback error", "error", err, "sid", inst.sid)
 							return
 						}
 						index += 1
@@ -1068,7 +1068,7 @@ func isTokenLimitExceededError(err error) bool {
 // WrapperDestroy 会话资源销毁
 func WrapperDestroy(hdl interface{}) (err error) {
 	inst := (*wrapperInst)(hdl.(unsafe.Pointer))
-	wLogger.Debugw("WrapperDestroy", "sid", inst.sid)
+	wLogger.Infow("WrapperDestroy", "sid", inst.sid)
 	inst.active = false
 	inst.stopQ <- true
 
@@ -1086,13 +1086,13 @@ func WrapperFini() (err error) {
 	if cmd != nil && cmd.Process != nil {
 		if err = cmd.Process.Kill(); err != nil {
 			fmt.Printf("WrapperFini err:%v\n", err)
-			wLogger.Debugf("WrapperFini err:%v", err)
+			wLogger.Infof("WrapperFini err:%v", err)
 		} else {
 			fmt.Printf("WrapperFini cmd kill success\n")
-			wLogger.Debugf("WrapperFini cmd kill success")
+			wLogger.Infof("WrapperFini cmd kill success")
 		}
 	}
-	wLogger.Debugf("WarpperFini success")
+	wLogger.Infof("WarpperFini success")
 	return
 }
 
@@ -1156,7 +1156,7 @@ func lora_load(pretrainedName, loraWeightPath, loraIdStr string) error {
 		wLogger.Errorw(msg)
 		return fmt.Errorf(msg)
 	}
-	wLogger.Debugf("checkValidLora:%v", msg)
+	wLogger.Infof("checkValidLora:%v", msg)
 
 	// lora 加载
 	// TODO: 实现lora加载逻辑
@@ -1169,7 +1169,7 @@ func lora_load(pretrainedName, loraWeightPath, loraIdStr string) error {
 		wLogger.Errorw("WrapperLoadRes failed to load lora", "resId", loraIdStr, "error", err)
 		return fmt.Errorf("failed to load lora: %v", err)
 	}
-	wLogger.Debugf("WrapperLoadRes load lora success, resId:%v, loadResp:%v", loraIdStr, string(loadResp))
+	wLogger.Infof("WrapperLoadRes load lora success, resId:%v, loadResp:%v", loraIdStr, string(loadResp))
 
 	return nil
 }
@@ -1328,7 +1328,7 @@ func checkValidLora(pretrainedName string, loraPath string) (isValid bool, msg s
 
 // WrapperUnloadRes 卸载资源
 func WrapperUnloadRes(resId int) (err error) {
-	wLogger.Debugf("WrapperUnloadRes unload lora start", "resId", resId)
+	wLogger.Infof("WrapperUnloadRes unload lora start", "resId", resId)
 	resIdStr := strconv.Itoa(resId)
 	patchIdMapMutex.Lock()
 	patchRes, ok := patchResMap[resIdStr]
@@ -1352,7 +1352,7 @@ func WrapperUnloadRes(resId int) (err error) {
 		wLogger.Errorw("WrapperUnloadRes failed to unload lora", "resId", resId, "error", err)
 		return fmt.Errorf("failed to unload lora: %v", err)
 	}
-	wLogger.Debugf("WrapperUnloadRes unload lora success, resId:%v, unloadResp:%v", resId, string(unloadResp))
+	wLogger.Infof("WrapperUnloadRes unload lora success, resId:%v, unloadResp:%v", resId, string(unloadResp))
 
 	// // 删除记录
 	// os.Remove(filepath.Join("/home/.atp/lora_record", resIdStr))
