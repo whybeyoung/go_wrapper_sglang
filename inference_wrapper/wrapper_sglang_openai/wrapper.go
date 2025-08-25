@@ -132,6 +132,12 @@ func writePortToFile(port int) error {
 	return err
 }
 
+func getEnvValue(key string) string {
+	envStr := os.Getenv(key)
+	wLogger.Infof("getEnvValue %s=%s", key, envStr)
+	return envStr
+}
+
 // WrapperInit 插件初始化, 全局只调用一次. 本地调试时, cfg参数由aiges.toml提供
 func WrapperInit(cfg map[string]string) (err error) {
 	fmt.Printf("---- wrapper init ----\n")
@@ -196,20 +202,20 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 从环境变量获取配置
-	baseModel := os.Getenv("FULL_MODEL_PATH")
+	baseModel := getEnvValue("FULL_MODEL_PATH")
 
-	isReasoningModelStr := os.Getenv("IS_REASONING_MODEL")
+	isReasoningModelStr := getEnvValue("IS_REASONING_MODEL")
 	if isReasoningModelStr == "true" {
 		isReasoningModel = true
 	}
 
-	reasoningEffortStr := os.Getenv("REASONING_EFFORT")
+	reasoningEffortStr := getEnvValue("REASONING_EFFORT")
 	if reasoningEffortStr != "" {
 		reasoningEffort = reasoningEffortStr
 	}
 
 	// 获取端口配置
-	port := os.Getenv("HTTP_SERVER_PORT")
+	port := getEnvValue("HTTP_SERVER_PORT")
 	if port != "" {
 		httpServerPort, _ = strconv.Atoi(port)
 		if httpServerPort == 0 {
@@ -226,7 +232,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 获取额外参数
-	extraArgs := os.Getenv("CMD_EXTRA_ARGS")
+	extraArgs := getEnvValue("CMD_EXTRA_ARGS")
 	if extraArgs == "" {
 		extraArgs = "--mem-fraction-static 0.93 --torch-compile-max-bs 8 --max-running-requests 20"
 		wLogger.Infow("Using default CMD_ARGS", "args", extraArgs)
@@ -235,13 +241,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 检查是否启用指标
-	enableMetrics := os.Getenv("ENABLE_METRICS")
+	enableMetrics := getEnvValue("ENABLE_METRICS")
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
 		wLogger.Infow("Metrics enabled")
 	}
 	// 读取generation_config.json文件
-	preferredSamplingParams := os.Getenv("PREFERRED_SAMPLING_PARAMS")
+	preferredSamplingParams := getEnvValue("PREFERRED_SAMPLING_PARAMS")
 	if preferredSamplingParams != "" {
 		extraArgs += fmt.Sprintf(" --preferred-sampling-params %v ", preferredSamplingParams)
 	} else if baseModel != "" {
@@ -263,24 +269,24 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 检查是否启用tools
-	toolCallParser := os.Getenv("TOOL_CALL_PARSER")
+	toolCallParser := getEnvValue("TOOL_CALL_PARSER")
 	if len(toolCallParser) > 0 {
 		extraArgs += fmt.Sprintf(" --tool-call-parser %v ", toolCallParser)
 	}
 	// 检查多节点模式
-	enableMultiNode := os.Getenv("ENABLE_MULTI_NODE_MODE")
+	enableMultiNode := getEnvValue("ENABLE_MULTI_NODE_MODE")
 	if enableMultiNode == "true" {
 		wLogger.Infow("Multi-node mode enabled")
 
 		// 获取组大小
-		if groupSize := os.Getenv("LWS_GROUP_SIZE"); groupSize != "" {
+		if groupSize := getEnvValue("LWS_GROUP_SIZE"); groupSize != "" {
 			extraArgs += fmt.Sprintf(" --nnodes %s", groupSize)
 		}
 
 		// 获取leader地址
-		if leaderAddr := os.Getenv("LWS_LEADER_ADDRESS"); leaderAddr != "" {
+		if leaderAddr := getEnvValue("LWS_LEADER_ADDRESS"); leaderAddr != "" {
 
-			distPort := os.Getenv("DIST_PORT")
+			distPort := getEnvValue("DIST_PORT")
 			if distPort == "" {
 				distPort = "20000"
 			}
@@ -288,21 +294,21 @@ func WrapperInit(cfg map[string]string) (err error) {
 		}
 
 		// 获取worker索引
-		if workerIndex := os.Getenv("LWS_WORKER_INDEX"); workerIndex != "" {
+		if workerIndex := getEnvValue("LWS_WORKER_INDEX"); workerIndex != "" {
 			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
 		}
 	}
 
-	pretrainedName = os.Getenv("PRETRAINED_MODEL_NAME")
-	finetuneType = os.Getenv("FINETUNE_TYPE")
-	loraSetting := os.Getenv("LORA_SETTING")
+	pretrainedName = getEnvValue("PRETRAINED_MODEL_NAME")
+	finetuneType = getEnvValue("FINETUNE_TYPE")
+	loraSetting := getEnvValue("LORA_SETTING")
 	if loraSetting != "" {
 		if finetuneType == "" {
 			finetuneType = "lora"
 		}
 		extraArgs += loraSetting
 	}
-	globalEnableThinkingStr := os.Getenv("GLOBAL_ENABLE_THINKING")
+	globalEnableThinkingStr := getEnvValue("GLOBAL_ENABLE_THINKING")
 	if globalEnableThinkingStr == "false" {
 		globalEnableThinking = false
 	}
@@ -739,6 +745,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	streamReq.ExtraBody = map[string]any{
 		"chat_template_kwargs": map[string]interface{}{
 			"enable_thinking": enableThinking,
+			"thinking":        enableThinking, // deepseekv31使用
 		},
 	}
 
@@ -799,7 +806,6 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 
 	openaiMsgs, functions := formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
-	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 	thinking := false
 	if isReasoningModel {
 		lastMsg := openaiMsgs[len(openaiMsgs)-1]
@@ -811,6 +817,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			thinking = true
 		}
 	}
+	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 	return streamReq, functions, thinking
 }
 
