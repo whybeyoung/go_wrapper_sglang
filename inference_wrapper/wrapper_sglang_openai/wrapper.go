@@ -389,8 +389,17 @@ func WrapperInit(cfg map[string]string) (err error) {
 	patchResMap = make(map[string]PatchRes)
 	patchIdInnerPatchIdMap = make(map[string]string)
 
+	err = gwsUtils.UpdatePodMetricsPort(httpServerPort)
+	if err != nil {
+		wLogger.Errorw("updatePodMetricsPort failed", "error", err)
+		return err
+	}
 	wLogger.Debugw("WrapperInit successful")
 	return
+}
+
+func updatePodMetricsPort() {
+
 }
 
 func reportSglangMetrics(serverMetricURL string) {
