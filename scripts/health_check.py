@@ -5,6 +5,8 @@ def checkPortAlive() -> bool:
     try:
         with open("/home/aiges/.status", "r") as file:
             content = file.read().strip()
+        with open("/home/aiges/sglangport", "r") as file:
+            sglangPort = file.read().strip()
 
         if ":" in content:
             ip, port = content.split(":")
@@ -17,6 +19,11 @@ def checkPortAlive() -> bool:
         print(f"check addr {ip}:{port}\n")
         rpc_checker_cmd = f"nc -zv {ip} {port}"
         ret = subprocess.call(rpc_checker_cmd, shell=True)
+        if ret != 0:
+            exit(ret)
+        print(f"check sglang addr {ip}:{sglangPort}\n")
+        sglangPortCheckCmd = f"nc -zv {ip} {sglangPort}"
+        ret = subprocess.call(sglangPortCheckCmd, shell=True)
         if ret != 0:
             exit(ret)
     except Exception as e:
