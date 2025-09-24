@@ -1207,7 +1207,7 @@ func parseMessages(prompt string) MessageParseResult {
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
+func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
 	parseResult := parseMessages(prompt)
 	messages := parseResult.Messages
 

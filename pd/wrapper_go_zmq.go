@@ -53,17 +53,25 @@ var (
 	meterFunc                     func(usrTag string, key string, count int) (code int)
 	LbExtraFunc                   func(params map[string]string) error
 	throughputMax                 float64
+	tokenizerWorkerNum            int
+	maxStopWords                  int  = 16   // 添加全局变量存储最大停止词数
 	isGoRecvTokenizer             bool = true // 是否是 Go Recv Tokenizer 模式
 	enableJsonModeSysPromptInject bool = true // 是否注入json模式系统提示
 	enableJsonModePostProcess     bool = true // 是否进行json模式后处理
+	enableAppIdHeader             bool = true // 是否启用 appID 请求级别metadata
 	serviceName                   string
+	customerHeader                string = "x-customer-labels"
+
+	// extra body
+	continueFinalMessage bool = false // 是否继续最终消息
 )
 
 const JSONMODE_SYS_PROMPT = ` "请生成纯JSON，不要加 json, 还有三反引号或其他 Markdown 标记"`
 
 const (
-	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
-	ENGINE_REQUEST_ERR              = "ENGINE_REQUEST_ERR;code=2002"
+	ENGINE_TOKEN_LIMIT_EXCEEDED_ERR       = "ENGINE_TOKEN_LIMIT_EXCEEDED;code=2001"
+	ENGINE_REQUEST_ERR                    = "ENGINE_REQUEST_ERR;code=2002"
+	REQUEST_CAHT_STOPWORDS_LIMIT_EXCEEDED = "REQUEST_CAHT_STOPWORDS_LIMIT_EXCEEDED;code=2003"
 )
 
 // RequestManager 请求管理器
@@ -107,16 +115,18 @@ type SingleStrOut struct {
 
 // wrapperInst 结构体定义
 type wrapperInst struct {
-	usrTag         string
-	sid            string
-	client         *OpenAIClient
-	firstFrame     bool
-	firstChunkTime time.Time
-	callback       comwrapper.CallBackPtr
-	params         map[string]string
-	active         bool
-	SessionManager *SessionManager
-	Stream         *openai.ChatCompletionStream
+	usrTag               string
+	sid                  string
+	appId                string
+	client               *OpenAIClient
+	firstFrame           bool
+	firstChunkTime       time.Time
+	callback             comwrapper.CallBackPtr
+	params               map[string]string
+	active               bool
+	continueFinalMessage bool
+	SessionManager       *SessionManager
+	Stream               *openai.ChatCompletionStream
 	// StopStreamChan      chan bool
 	SingleOutChan       chan SingleStrOut
 	chanMu              sync.Mutex // 添加互斥锁保护 channel 操作
@@ -137,6 +147,7 @@ func (s schemaMarshaler) MarshalJSON() ([]byte, error) {
 
 // 额外参数
 type ExtraParams struct {
+	Stop           []string `json:"stop,omitempty"`
 	ResponseFormat *struct {
 		Type       string `json:"type,omitempty"`
 		JSONSchema *struct {
@@ -146,7 +157,13 @@ type ExtraParams struct {
 			Strict      bool                   `json:"strict"`
 		} `json:"json_schema,omitempty"`
 	} `json:"response_format,omitempty"`
-	LogitBias map[string]int `json:"logit_bias,omitempty"`
+	LogitBias            map[string]int `json:"logit_bias,omitempty"`
+	ContinueFinalMessage bool           `json:"continue_final_message,omitempty"`
+}
+
+// app_Id
+type CustomerLabel struct {
+	AppId string `json:"app_id,omitempty"`
 }
 
 // todo move to single file
@@ -418,7 +435,7 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 				delta := newMetricValue - lastMetricValue
 				deltaTime := time.Since(lastReportTime)
 				lastReportTime = time.Now()
-				if isDecodeMode {
+				if isDecodeMode && !has_generation_tokens_total {
 					throughput = newMetricValue
 				} else {
 					throughput = float64(delta) / deltaTime.Seconds()
@@ -520,6 +537,10 @@ func WrapperInit(cfg map[string]string) (err error) {
 		promptSearchTemplateNoIndex = v
 	}
 
+	if v, ok := cfg["max_stop_words"]; ok {
+		maxStopWords, _ = strconv.Atoi(v)
+	}
+
 	// 获取指标上报地址
 	if v, ok := cfg["throughput_max"]; ok {
 		throughputMax, _ = strconv.ParseFloat(v, 64)
@@ -585,6 +606,15 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("JsonMode Post Process is enabled")
 	}
 
+	// 获取是否启用 appID 请求级别metadata
+	enableAppIdHeaderStr := os.Getenv("ENABLE_APP_ID_HEADER")
+	if enableAppIdHeaderStr == "false" {
+		enableAppIdHeader = false
+		wLogger.Infow("Enable App Id Header is disabled")
+	} else {
+		wLogger.Infow("Enable App Id Header is enabled")
+	}
+
 	// 获取端口配置
 	port := os.Getenv("HTTP_SERVER_PORT")
 	if port == "" {
@@ -600,7 +630,15 @@ func WrapperInit(cfg map[string]string) (err error) {
 	sglangTokenizerMode := os.Getenv("SGLANG_TOKENIZER_MODE")
 	if sglangTokenizerMode == "noraml" {
 		isGoRecvTokenizer = false
+		tokenizerWorkerNumStr := os.Getenv("SGLANG_TOKENIZER_WORKER_NUM")
+		if tokenizerWorkerNumStr == "" {
+			tokenizerWorkerNum = 1
+		} else {
+			tokenizerWorkerNum, _ = strconv.Atoi(tokenizerWorkerNumStr)
+			fmt.Printf("SGLang Tokenizer Worker Num: %d\n", tokenizerWorkerNum)
+		}
 	}
+
 	// 检查PD模式
 	pdType := os.Getenv("AIGES_PD_ROLE")
 
@@ -633,12 +671,18 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Using custom CMD_ARGS", "args", extraArgs)
 	}
 
+	//
 	// 检查是否启用指标
 	enableMetrics := os.Getenv("ENABLE_METRICS")
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
 		metricsAutoReport = true
 		wLogger.Infow("Metrics enabled")
+	}
+	if !isGoRecvTokenizer {
+		if tokenizerWorkerNum > 1 {
+			extraArgs += fmt.Sprintf(" --tokenizer-worker-num %d", tokenizerWorkerNum)
+		}
 	}
 
 	isDecodeMode = true // 默认为decode模式
@@ -756,7 +800,9 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	for k, v := range params {
 		paramStr += fmt.Sprintf("%s=%s;", k, v)
 	}
-	wLogger.Debugw("WrapperCreate start", "paramStr", paramStr, "sid", sid)
+	appId := params["app_id"]
+
+	wLogger.Debugw("WrapperCreate start", "paramStr", paramStr, "sid", sid, "appId", appId)
 
 	// 创建新的实例
 	inst := &wrapperInst{
@@ -771,11 +817,13 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		SessionManager: sessionManager,
 		SingleOutChan:  make(chan SingleStrOut, dataChanBufferSize),
 		// StopStreamChan:      make(chan bool, 2),
-		SingleOutChanClosed: false, // 使用大写开头的字段名
+		SingleOutChanClosed:  false, // 使用大写开头的字段名
+		appId:                appId,
+		continueFinalMessage: continueFinalMessage,
 	}
 	if inst.SessionManager != nil {
 		inst.SessionManager.AddRequest(inst.sid, inst) // 传入 inst 指针
-		wLogger.Infow("WrapperCreate added request state for pd mode", "sid", inst.sid)
+		wLogger.Infow("WrapperCreate added request state for pd mode", "sid", inst.sid, "appId", inst.appId)
 	}
 
 	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
@@ -821,12 +869,11 @@ func waitServerReady(serverURL string) error {
 			resp.Body.Close()
 			return nil
 		}
-
 		if resp != nil {
 			resp.Body.Close()
 		}
 
-		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1)
+		wLogger.Debugw("Server not ready, retrying...", "url", serverURL, "attempt", i+1, "error", err)
 		time.Sleep(time.Second)
 	}
 	return fmt.Errorf("server failed to start after %d attempts", maxRetries)
@@ -854,8 +901,252 @@ func getLocalIP() string {
 	return localAddr.IP.String()
 }
 
+func (inst *wrapperInst) checkPrefillFirstKeepAlive(ttft time.Duration, outStr string) {
+	/*
+		1. Prefill 发送 keepalive_down 信号
+		2. 设置 inst.active 为 false
+		3. 返回
+	*/
+	keepAliveData := comwrapper.WrapperData{
+		Key:      "__keepalive_down",
+		Data:     []byte{},
+		Desc:     nil,
+		Encoding: "utf-8",
+		Type:     comwrapper.DataText,
+		Status:   comwrapper.DataEnd,
+	}
+
+	if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
+		wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
+	} else {
+		wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", outStr)
+
+	}
+	inst.active = false
+	return
+}
+
+func (inst *wrapperInst) preprocessJsonModeBrace(originalStr string, hasFoundJsonTokenStart *bool, enableJsonModePostProcess bool) string {
+	// 特殊处理 JsonMode首字 不合法
+	if inst.jsonMode && !*hasFoundJsonTokenStart && enableJsonModePostProcess {
+		// 查找 { 的位置
+		braceIndex := strings.Index(originalStr, "{")
+		if braceIndex >= 0 {
+			// 如果找到了 {，保留从 { 开始到结尾的所有内容
+			*hasFoundJsonTokenStart = true
+			originalStr = originalStr[braceIndex:]
+			wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - found brace", "sid", inst.sid, "originalStr", originalStr, "convertedStr", originalStr)
+		} else {
+			// 如果没有找到 {，则全部去除
+			originalStr = ""
+			wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - no brace found", "sid", inst.sid, "originalStr", originalStr, "convertedStr", originalStr)
+		}
+	}
+	return originalStr
+}
+
+func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
+	// 添加 token 计数变量
+	var chunkIndex int = 0
+	var finished bool = false
+	var ttft time.Duration
+	var hasFoundJsonTokenStart bool = false
+	var status comwrapper.DataStatus = comwrapper.DataBegin
+
+	defer inst.abortRequest(inst.sid)
+	for {
+		if !inst.active {
+			wLogger.Infow("WrapperWrite Recv Goroutine exit", "sid", inst.sid)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			wLogger.Infow("Context timeout or cancelled, closing stream", "sid", inst.sid)
+			inst.active = false
+			err := errors.New(fmt.Sprintf("context timeout or cancelled, sid: %s", inst.sid))
+			if err := inst.callback(inst.usrTag, nil, err); err != nil {
+				wLogger.Errorw("WrapperWrite timeout callback failed", "error", err, "sid", inst.sid)
+			}
+			return
+		default:
+			if response, err := inst.Stream.Recv(); err != nil {
+				wLogger.Debugw("Native Stream Recv error...", "error", err, "sid", inst.sid)
+				inst.active = false
+				// 检查是否是token超限错误
+				if isTokenLimitExceededError(err) {
+					wLogger.Warnw("Token limit exceeded error detected", "error", err, "sid", inst.sid)
+					// 创建一个自定义的token超限错误
+					tokenLimitErr := errors.New(ENGINE_TOKEN_LIMIT_EXCEEDED_ERR)
+					if err := inst.callback(inst.usrTag, nil, tokenLimitErr); err != nil {
+						wLogger.Errorw("Token limit exceeded callback failed", "error", err, "sid", inst.sid)
+					}
+				} else {
+					wLogger.Errorw("Recv error...", "error", err, "sid", inst.sid)
+				}
+			} else {
+				var chunkContent string
+				var chunkResponse map[string]interface{}
+
+				// 创建响应数据切片
+				responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
+				if len(response.Choices) > 0 {
+					chunkContent = response.Choices[0].Delta.Content
+					wLogger.Infow("Decode Get Chunk", "sid", inst.sid, "outStr", chunkContent)
+				}
+				if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
+					ttft = time.Since(inst.firstChunkTime)
+					inst.checkPrefillFirstKeepAlive(ttft, chunkContent)
+					return
+
+				} else if chunkIndex == 0 && !inst.SessionManager.IsPrefillMode() {
+					// 非 prefill 模式 仅记录ttft
+					ttft = time.Since(inst.firstChunkTime)
+					wLogger.Infow("Decode Get First Chunk,  send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", chunkContent)
+
+					// 处理content数据
+					// 特殊处理 JsonMode首字 不合法
+					chunkContent = inst.preprocessJsonModeBrace(chunkContent, &hasFoundJsonTokenStart, enableJsonModePostProcess)
+					// 处理thinking结束的情况
+					if chunkContent == "<think>" {
+						inst.thinkingMode = true
+						chunkContent = ""
+					}
+
+					if chunkContent == "</think>" {
+						inst.thinkingMode = false
+						chunkContent = ""
+					}
+					chunkIndex++
+
+				} else if (chunkIndex == 1 || chunkIndex == 2) && !inst.SessionManager.IsPrefillMode() {
+					// 处理thinking结束的情况,真尼玛恶心
+					if chunkContent == "<think>" {
+						inst.thinkingMode = true
+						chunkContent = ""
+					}
+				}
+				if chunkContent == "</think>" {
+					inst.thinkingMode = false
+					chunkContent = ""
+				}
+				if inst.thinkingMode && !inst.jsonMode {
+					// 构建增量响应结构
+					chunkResponse = map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{
+								"content":           "",
+								"reasoning_content": chunkContent,
+								"index":             0,
+								"role":              "assistant",
+							},
+						},
+						"question_type": "",
+					}
+				} else if !inst.functionCallMode {
+					chunkResponse = map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{
+								"content":           chunkContent,
+								"reasoning_content": "",
+								"index":             0,
+								"role":              "assistant",
+							},
+						},
+						"question_type": "",
+					}
+				} else {
+					// 这里需要 tool call parser 流式解析结果
+					// 需要重写python这块的 toolcall parser 流式解析结果
+					// todo
+					chunkResponse = map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{
+								"content":           nil,
+								"reasoning_content": "",
+								"index":             0,
+								"role":              "assistant",
+								"function_call":     chunkContent,
+							},
+						},
+						"question_type": "",
+					}
+				}
+				if chunkIndex > 0 {
+					status = comwrapper.DataContinue
+				}
+
+				chunkIndex++
+				// 序列化增量响应
+				chunkJSON, err := json.Marshal(chunkResponse)
+				if err != nil {
+					wLogger.Errorw("Failed to marshal chunk response", "error", err, "sid", inst.sid)
+					continue
+				}
+				// 创建响应数据
+				contentData := comwrapper.WrapperData{
+					Key:      "content",
+					Data:     chunkJSON,
+					Desc:     nil,
+					Encoding: "utf-8",
+					Type:     comwrapper.DataText,
+					Status:   status,
+				}
+				if response.Usage != nil {
+					finished = true
+					contentData.Status = comwrapper.DataEnd
+					status = comwrapper.DataEnd
+					// 创建usage数据结构
+					usageData := struct {
+						PromptTokens            int                             `json:"prompt_tokens"`
+						CompletionTokens        int                             `json:"completion_tokens"`
+						TotalTokens             int                             `json:"total_tokens"`
+						QuestionTokens          int                             `json:"question_tokens"`
+						PromptTokensDetails     *openai.PromptTokensDetails     `json:"prompt_tokens_details"`
+						CompletionTokensDetails *openai.CompletionTokensDetails `json:"completion_tokens_details"`
+					}{
+						PromptTokens:            response.Usage.PromptTokens,
+						CompletionTokens:        response.Usage.CompletionTokens,
+						TotalTokens:             response.Usage.PromptTokens + response.Usage.CompletionTokens,
+						PromptTokensDetails:     response.Usage.PromptTokensDetails,
+						CompletionTokensDetails: response.Usage.CompletionTokensDetails,
+
+						QuestionTokens: 0,
+					}
+
+					// 序列化usage数据
+					usageJSON, err := json.Marshal(usageData)
+					if err != nil {
+						wLogger.Errorw("WrapperWrite marshal usage error", "error", err, "sid", inst.sid)
+						return
+					}
+					wLogger.Infow("WrapperWrite usage data", "usage", string(usageJSON), "sid", inst.sid)
+
+					usageWrapperData := comwrapper.WrapperData{
+						Key:      "usage",
+						Data:     usageJSON,
+						Desc:     nil,
+						Encoding: "utf-8",
+						Type:     comwrapper.DataText,
+						Status:   status,
+					}
+					responseData = append(responseData, usageWrapperData)
+				}
+				if finished {
+					contentData.Status = comwrapper.DataEnd
+				}
+				responseData = append(responseData, contentData)
+				// 发送响应数据
+				if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
+					wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+				}
+			}
+		}
+	}
+
+}
+
 // handleSingleOutChan 处理SingleOutChan的数据
-func (inst *wrapperInst) handleRidResponse() {
+func (inst *wrapperInst) handleGoRecvTokenizer() {
 	// 添加 token 计数变量
 	var totalPromptTokens, totalCompletionTokens int
 	var chunkIndex int = 0
@@ -879,50 +1170,22 @@ func (inst *wrapperInst) handleRidResponse() {
 			}
 			ttft = time.Since(inst.firstChunkTime)
 			if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
-				keepAliveData := comwrapper.WrapperData{
-					Key:      "__keepalive_down",
-					Data:     []byte{},
-					Desc:     nil,
-					Encoding: "utf-8",
-					Type:     comwrapper.DataText,
-					Status:   comwrapper.DataEnd,
-				}
-
-				if err := inst.callback(inst.usrTag, []comwrapper.WrapperData{keepAliveData}, nil); err != nil {
-					wLogger.Errorw("Prefill Mode  get first chunk ,send keepalive_down callback error", "error", err, "sid", inst.sid)
-				} else {
-					wLogger.Infow("Prefill Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", singleOut.OutputStr)
-				}
-				// preifll 第一帧就结束 并发送释放信号
-				inst.active = false
+				inst.checkPrefillFirstKeepAlive(ttft, singleOut.OutputStr)
 				return
+
 			} else if chunkIndex == 0 && !inst.SessionManager.IsPrefillMode() {
 				// 非 prefill 模式 仅记录ttft
 				wLogger.Infow("Decode Get First Chunk, Set inst.active to false, send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", singleOut.OutputStr)
 				// 特殊处理 JsonMode首字 不合法
-				if inst.jsonMode && !hasFoundJsonTokenStart && enableJsonModePostProcess {
-					// 查找 { 的位置
-					braceIndex := strings.Index(singleOut.OutputStr, "{")
-					if braceIndex >= 0 {
-						// 如果找到了 {，保留从 { 开始到结尾的所有内容
-						hasFoundJsonTokenStart = true
-						originalStr := singleOut.OutputStr
-						singleOut.OutputStr = singleOut.OutputStr[braceIndex:]
-						wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - found brace", "sid", inst.sid, "originalStr", originalStr, "convertedStr", singleOut.OutputStr)
-					} else {
-						// 如果没有找到 {，则全部去除
-						originalStr := singleOut.OutputStr
-						singleOut.OutputStr = ""
-						wLogger.Warnw("Decode Mode JsonMode First Chunk is not valid. Doing Convert - no brace found", "sid", inst.sid, "originalStr", originalStr, "convertedStr", singleOut.OutputStr)
-					}
-				}
+				singleOut.OutputStr = inst.preprocessJsonModeBrace(singleOut.OutputStr, &hasFoundJsonTokenStart, enableJsonModePostProcess)
+
 			}
+			var chunkResponse map[string]interface{}
 
 			// 累加 token 数量
 			totalPromptTokens = singleOut.PromptTokens
 			totalCompletionTokens = singleOut.CompletionTokens
 
-			var chunkResponse map[string]interface{}
 			if singleOut.OutputStr == "</think>" {
 				inst.thinkingMode = false
 				singleOut.OutputStr = ""
@@ -1071,6 +1334,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 	// 继续处理原有的请求逻辑
 	var pdInfo *PDInfo
+	var stop []string
 
 	if inst.SessionManager.IsPrefillMode() {
 		pdInfo = getPDInfo()
@@ -1174,7 +1438,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 	if isGoRecvTokenizer {
 		// 启动一个 goroutine 来处理 接收到的SingleOutChan 的数据
-		go inst.handleRidResponse()
+		go inst.handleGoRecvTokenizer()
 	}
 
 	for _, v := range req {
@@ -1231,15 +1495,32 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 				}
 			}
-		}
 
+		}
+		if len(extraParams.Stop) > 0 {
+			if len(extraParams.Stop) > maxStopWords {
+				wLogger.Warnw("WrapperWrite stop words over limit", "stop", extraParams.Stop, "maxStopWords", maxStopWords, "sid", inst.sid)
+				stop = extraParams.Stop[:maxStopWords]
+			} else {
+				stop = extraParams.Stop
+				wLogger.Warnw("WrapperWrite stop words", "stop", extraParams.Stop, "sid", inst.sid)
+
+			}
+
+		}
+		if extraParams.ContinueFinalMessage {
+			inst.continueFinalMessage = true
+		}
 		wLogger.Infow("WrapperWrite request parameters",
 			"sid", inst.sid,
+			"appId", inst.appId,
 			"temperature", temperature,
-			"maxTokens", maxTokens)
+			"maxTokens", maxTokens,
+			"stop", stop,
+			"continueFinalMessage", inst.continueFinalMessage)
 
 		// 创建流式请求
-		formatResult := formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+		formatResult := inst.formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 		messages := convertToOpenAIMessages(formatResult.Messages)
 		functions := formatResult.Functions
 
@@ -1318,6 +1599,28 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				},
 			},
 		}
+		// use stop
+		if len(stop) > 0 {
+			streamReq.Stop = stop
+		}
+
+		if inst.continueFinalMessage {
+			streamReq.ExtraBody["continue_final_message"] = true
+		}
+
+		// 设定 appID 请求级别，用于统计
+		if inst.appId != "" && enableAppIdHeader {
+			appIdHeader := CustomerLabel{
+				AppId: inst.appId,
+			}
+			appIdHeaderStr, err := json.Marshal(appIdHeader)
+			if err != nil {
+				wLogger.Errorw("WrapperWrite marshal appIdHeader error", "error", err, "sid", inst.sid, "appId", inst.appId)
+			}
+			streamReq.Metadata = map[string]string{
+				customerHeader: string(appIdHeaderStr),
+			}
+		}
 
 		if len(functions) > 0 {
 			wLogger.Debugw("WrapperWrite functions", "functions", functions)
@@ -1344,68 +1647,199 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				"enable_thinking": enableThinking,
 			}
 		}
-
 		// 使用协程处理流式请求
-		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
-			wLogger.Infow("WrapperWrite Upstream starting stream inference", "sid", inst.sid)
+		go inst.StreamOAI(streamReq, v.Status)
+	}
+	return nil
+}
 
-			ctx, cancel := context.WithTimeout(context.Background(), timeDDL)
-			defer cancel()
+// formatMessages 格式化消息，支持搜索模板
+func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
+	parseResult := parseMessages(prompt)
+	messages := parseResult.Messages
 
-			stream, streamErr := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
-			if streamErr != nil {
-				// 发送错误响应
-				if cbkerr := inst.callback(inst.usrTag, nil, streamErr); cbkerr != nil {
-					wLogger.Errorw("WrapperWrite Upstream error callback failed", "error", cbkerr, "sid", inst.sid)
-				} else {
-					wLogger.Infow("WrapperWrite Upstream error callback success", "sid", inst.sid, "error", streamErr)
+	// 如果没有搜索模板，直接返回解析后的消息和函数
+	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+
+	var lastMessage *Message = messages[len(messages)-1]
+
+	if lastMessage.Role == "assistant" {
+		if lastMessage.Prefix != nil && *lastMessage.Prefix {
+			inst.continueFinalMessage = true
+		}
+	}
+
+	// 查找最后一个tool消息
+	var lastToolMsg *Message
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "tool" {
+			lastToolMsg = &messages[i]
+			break
+		}
+	}
+
+	// 如果没有tool消息，直接返回
+	if lastToolMsg == nil {
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+
+	// 解析tool消息内容
+	var searchContent []map[string]interface{}
+	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
+		wLogger.Errorw("Failed to parse tool message content", "error", err)
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+
+	// 如果没有搜索内容，直接返回
+	if len(searchContent) == 0 {
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+
+	// 获取show_ref_label，默认为false
+	showRefLabel := false
+	if lastToolMsg.ShowRefLabel != nil {
+		showRefLabel = *lastToolMsg.ShowRefLabel
+	}
+
+	// 格式化搜索内容
+	var formattedContent []string
+	for _, content := range searchContent {
+		formattedText := fmt.Sprintf("[webpage %v begin]\n%v%v\n[webpage %v end]",
+			content["index"],
+			content["docid"],
+			content["document"],
+			content["index"])
+		formattedContent = append(formattedContent, formattedText)
+	}
+
+	// 获取当前日期
+	now := time.Now()
+	weekdays := []string{"日", "一", "二", "三", "四", "五", "六"}
+	currentDate := fmt.Sprintf("%d年%02d月%02d日星期%s",
+		now.Year(), now.Month(), now.Day(), weekdays[now.Weekday()])
+
+	// 查找最后一个用户消息并更新其内容
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			// 根据show_ref_label选择模板
+			templateStr := promptSearchTemplate
+			if !showRefLabel {
+				templateStr = promptSearchTemplateNoIndex
+			}
+
+			// 创建模板
+			tmpl, err := template.New("search").Parse(templateStr)
+			if err != nil {
+				wLogger.Errorw("Failed to parse template", "error", err)
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
+			}
+
+			// 准备模板数据
+			data := struct {
+				SearchResults string
+				CurDate       string
+				Question      string
+			}{
+				SearchResults: strings.Join(formattedContent, "\n"),
+				CurDate:       currentDate,
+				Question:      messages[i].Content.(string),
+			}
+
+			// 执行模板渲染
+			var result strings.Builder
+			if err := tmpl.Execute(&result, data); err != nil {
+				wLogger.Errorw("Failed to execute template", "error", err)
+				return MessageParseResult{
+					Messages:  messages,
+					Functions: parseResult.Functions,
+				}
+			}
+
+			messages[i].Content = result.String()
+			break
+		}
+	}
+
+	return MessageParseResult{
+		Messages:  messages,
+		Functions: parseResult.Functions,
+	}
+}
+
+func (inst *wrapperInst) StreamOAI(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
+	wLogger.Infow("WrapperWrite Upstream starting stream inference", "sid", inst.sid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeDDL)
+	defer cancel()
+
+	stream, streamErr := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
+	if streamErr != nil {
+		// 发送错误响应
+		if cbkerr := inst.callback(inst.usrTag, nil, streamErr); cbkerr != nil {
+			wLogger.Errorw("WrapperWrite Upstream error callback failed", "error", cbkerr, "sid", inst.sid)
+		} else {
+			wLogger.Infow("WrapperWrite Upstream error callback success", "sid", inst.sid, "error", streamErr)
+		}
+		return
+	}
+	inst.Stream = stream
+	// defer inst.Stream.Close()t
+
+	if isGoRecvTokenizer {
+		// 这里轮询判断 inst.active , 默认调用下 Stream的 Recv
+		for inst.active {
+
+			select {
+			case <-ctx.Done():
+				wLogger.Infow("Context timeout or cancelled, closing stream", "sid", inst.sid)
+				inst.active = false
+				err := errors.New(fmt.Sprintf("context timeout or cancelled, sid: %s", inst.sid))
+				if err := inst.callback(inst.usrTag, nil, err); err != nil {
+					wLogger.Errorw("WrapperWrite timeout callback failed", "error", err, "sid", inst.sid)
+				}
+				return
+			default:
+				if _, err := inst.Stream.Recv(); err != nil {
+					wLogger.Debugw("Stream Recv error...", "error", err, "sid", inst.sid)
+					inst.active = false
+					// 检查是否是token超限错误
+					if isTokenLimitExceededError(err) {
+						wLogger.Warnw("Token limit exceeded error detected", "error", err, "sid", inst.sid)
+						// 创建一个自定义的token超限错误
+						tokenLimitErr := errors.New(ENGINE_TOKEN_LIMIT_EXCEEDED_ERR)
+						if err := inst.callback(inst.usrTag, nil, tokenLimitErr); err != nil {
+							wLogger.Errorw("Token limit exceeded callback failed", "error", err, "sid", inst.sid)
+						}
+					} else {
+						wLogger.Errorw("Recv error...", "error", err, "sid", inst.sid)
+					}
 				}
 				return
 			}
-			inst.Stream = stream
-			// defer inst.Stream.Close()t
-			// 这里轮询判断 inst.active , 默认调用下 Stream的 Recv
-			for inst.active {
-
-				select {
-				case <-ctx.Done():
-					wLogger.Infow("Context timeout or cancelled, closing stream", "sid", inst.sid)
-					inst.active = false
-					err := errors.New(fmt.Sprintf("context timeout or cancelled, sid: %s", inst.sid))
-					if err := inst.callback(inst.usrTag, nil, err); err != nil {
-						wLogger.Errorw("WrapperWrite timeout callback failed", "error", err, "sid", inst.sid)
-					}
-					return
-				// case <-inst.StopStreamChan:
-				// 	wLogger.Infow("StopStreamChan received, closing stream", "sid", inst.sid)
-				// 	inst.active = false
-				// 	return
-				default:
-					if _, err := inst.Stream.Recv(); err != nil {
-						wLogger.Debugw("Stream Recv error...", "error", err, "sid", inst.sid)
-						// 第一帧就报错了，比如是 超长了
-						inst.active = false
-						// 检查是否是token超限错误
-						if isTokenLimitExceededError(err) {
-							wLogger.Warnw("Token limit exceeded error detected", "error", err, "sid", inst.sid)
-							// 创建一个自定义的token超限错误
-							tokenLimitErr := errors.New(ENGINE_TOKEN_LIMIT_EXCEEDED_ERR)
-							if err := inst.callback(inst.usrTag, nil, tokenLimitErr); err != nil {
-								wLogger.Errorw("Token limit exceeded callback failed", "error", err, "sid", inst.sid)
-							}
-						} else {
-							wLogger.Errorw("Recv error...", "error", err, "sid", inst.sid)
-						}
-					}
-					return
-				}
-			}
-			// 实例已经不活跃了， 退出协程 清理 closeStgream
-			wLogger.Infow("Write Upstream Stream stopped", "sid", inst.sid)
-		}(streamReq, v.Status)
+		}
+	} else {
+		inst.handleNativeTokenizer(ctx)
 	}
 
-	return nil
+	// 实例已经不活跃了， 退出协程 清理 closeStgream
+	wLogger.Infow("Write Upstream Stream stopped", "sid", inst.sid)
 }
 
 // isTokenLimitExceededError 检查是否是token超限错误
@@ -1540,128 +1974,6 @@ func parseMessages(prompt string) MessageParseResult {
 	}
 }
 
-// formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) MessageParseResult {
-	parseResult := parseMessages(prompt)
-	messages := parseResult.Messages
-
-	// 如果没有搜索模板，直接返回解析后的消息和函数
-	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
-		return MessageParseResult{
-			Messages:  messages,
-			Functions: parseResult.Functions,
-		}
-	}
-
-	// 查找最后一个tool消息
-	var lastToolMsg *Message
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "tool" {
-			lastToolMsg = &messages[i]
-			break
-		}
-	}
-
-	// 如果没有tool消息，直接返回
-	if lastToolMsg == nil {
-		return MessageParseResult{
-			Messages:  messages,
-			Functions: parseResult.Functions,
-		}
-	}
-
-	// 解析tool消息内容
-	var searchContent []map[string]interface{}
-	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
-		wLogger.Errorw("Failed to parse tool message content", "error", err)
-		return MessageParseResult{
-			Messages:  messages,
-			Functions: parseResult.Functions,
-		}
-	}
-
-	// 如果没有搜索内容，直接返回
-	if len(searchContent) == 0 {
-		return MessageParseResult{
-			Messages:  messages,
-			Functions: parseResult.Functions,
-		}
-	}
-
-	// 获取show_ref_label，默认为false
-	showRefLabel := false
-	if lastToolMsg.ShowRefLabel != nil {
-		showRefLabel = *lastToolMsg.ShowRefLabel
-	}
-
-	// 格式化搜索内容
-	var formattedContent []string
-	for _, content := range searchContent {
-		formattedText := fmt.Sprintf("[webpage %v begin]\n%v%v\n[webpage %v end]",
-			content["index"],
-			content["docid"],
-			content["document"],
-			content["index"])
-		formattedContent = append(formattedContent, formattedText)
-	}
-
-	// 获取当前日期
-	now := time.Now()
-	weekdays := []string{"日", "一", "二", "三", "四", "五", "六"}
-	currentDate := fmt.Sprintf("%d年%02d月%02d日星期%s",
-		now.Year(), now.Month(), now.Day(), weekdays[now.Weekday()])
-
-	// 查找最后一个用户消息并更新其内容
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			// 根据show_ref_label选择模板
-			templateStr := promptSearchTemplate
-			if !showRefLabel {
-				templateStr = promptSearchTemplateNoIndex
-			}
-
-			// 创建模板
-			tmpl, err := template.New("search").Parse(templateStr)
-			if err != nil {
-				wLogger.Errorw("Failed to parse template", "error", err)
-				return MessageParseResult{
-					Messages:  messages,
-					Functions: parseResult.Functions,
-				}
-			}
-
-			// 准备模板数据
-			data := struct {
-				SearchResults string
-				CurDate       string
-				Question      string
-			}{
-				SearchResults: strings.Join(formattedContent, "\n"),
-				CurDate:       currentDate,
-				Question:      messages[i].Content.(string),
-			}
-
-			// 执行模板渲染
-			var result strings.Builder
-			if err := tmpl.Execute(&result, data); err != nil {
-				wLogger.Errorw("Failed to execute template", "error", err)
-				return MessageParseResult{
-					Messages:  messages,
-					Functions: parseResult.Functions,
-				}
-			}
-
-			messages[i].Content = result.String()
-			break
-		}
-	}
-
-	return MessageParseResult{
-		Messages:  messages,
-		Functions: parseResult.Functions,
-	}
-}
-
 func WrapperExec(usrTag string, params map[string]string, reqData []comwrapper.WrapperData) (respData []comwrapper.WrapperData, err error) {
 	return nil, nil
 }
@@ -1745,12 +2057,12 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 	config := openai.DefaultConfig("maas")
 	config.BaseURL = baseURL
 	config.HTTPClient = &http.Client{
-		Timeout: timeDDL,
+		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:        6000,
-			MaxIdleConnsPerHost: 3000,
-			MaxConnsPerHost:     3000,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        10000,
+			MaxIdleConnsPerHost: 5000,
+			MaxConnsPerHost:     0,
+			IdleConnTimeout:     300 * time.Second,
 		},
 	}
 
@@ -1780,6 +2092,7 @@ type Message struct {
 	Role         string      `json:"role"`
 	Content      interface{} `json:"content"`
 	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
+	Prefix       *bool       `json:"prefix,omitempty"` // for continue final message
 }
 
 // Tool 工具结构
@@ -1808,11 +2121,25 @@ type Choice struct {
 	Message Message `json:"message"`
 }
 
+// CompletionTokensDetails Breakdown of tokens used in a completion.
+type CompletionTokensDetails struct {
+	AudioTokens     int `json:"audio_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// PromptTokensDetails Breakdown of tokens used in the prompt.
+type PromptTokensDetails struct {
+	AudioTokens  int `json:"audio_tokens"`
+	CachedTokens int `json:"cached_tokens"`
+}
+
 // Usage 使用量结构
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details"`
 }
 
 // 读取进程中-s 参数
