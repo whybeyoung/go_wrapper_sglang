@@ -58,10 +58,12 @@ var (
 	server                 = "http://127.0.0.1:%d" // 添加全局变量存储server url
 	isReasoningModel       bool
 	cmd                    *exec.Cmd
-	globalEnableThinking   = true
-	loadLoraAdapter        = "load_lora_adapter"
-	unloadLoraAdapter      = "unload_lora_adapter"
-	reasoningEffort        = "high"
+	globalEnableThinking          = true
+	loadLoraAdapter               = "load_lora_adapter"
+	unloadLoraAdapter             = "unload_lora_adapter"
+	reasoningEffort               = "high"
+	enableAppIdHeader      bool   = true // 是否启用 appID 请求级别metadata
+	customerHeader         string = "x-customer-labels"
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -394,6 +396,14 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Errorw("updatePodMetricsPort failed", "error", err)
 		return err
 	}
+	// 获取是否启用 appID 请求级别metadata
+	enableAppIdHeaderStr := os.Getenv("ENABLE_APP_ID_HEADER")
+	if enableAppIdHeaderStr == "false" {
+		enableAppIdHeader = false
+		wLogger.Infow("Enable App Id Header is disabled")
+	} else {
+		wLogger.Infow("Enable App Id Header is enabled")
+	}
 	wLogger.Debugw("WrapperInit successful")
 	return
 }
@@ -485,6 +495,7 @@ func getLocalIP() string {
 type wrapperInst struct {
 	usrTag     string
 	sid        string
+	appId      string
 	client     *OpenAIClient
 	stopQ      chan bool
 	firstFrame bool
@@ -501,11 +512,13 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		paramStr += fmt.Sprintf("%s=%s;", k, v)
 	}
 	wLogger.Debugw("WrapperCreate start", "paramStr", paramStr, "sid", sid)
+	appId := params["app_id"]
 
 	// 创建新的实例
 	inst := &wrapperInst{
 		usrTag:     usrTag,
 		sid:        sid,
+		appId:      appId,
 		client:     requestManager.Client,
 		stopQ:      make(chan bool, 2),
 		firstFrame: true,
@@ -626,8 +639,15 @@ type ExtraParams struct {
 			Strict      bool                   `json:"strict"`
 		} `json:"json_schema,omitempty"`
 	} `json:"response_format,omitempty"`
-	LogitBias       map[string]int `json:"logit_bias,omitempty"`
-	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
+	LogitBias        map[string]int `json:"logit_bias,omitempty"`
+	ReasoningEffort  string         `json:"reasoning_effort,omitempty"`
+	FrequencyPenalty *float32       `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float32       `json:"presence_penalty,omitempty"`
+}
+
+// app_Id
+type CustomerLabel struct {
+	AppId string `json:"app_id,omitempty"`
 }
 
 func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition, req *openai.ChatCompletionRequest) error {
@@ -721,6 +741,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			wLogger.Warnw("Invalid top_p value", "value", tpStr, "sid", inst.sid)
 		}
 	}
+
 	streamReq := &openai.ChatCompletionRequest{
 		Model: DEFAULT_MODEL_NAME,
 	}
@@ -741,6 +762,19 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	streamReq.Stream = true
 	streamReq.StreamOptions = &openai.StreamOptions{
 		IncludeUsage: true,
+	}
+	// 设定 appID 请求级别，用于统计
+	if inst.appId != "" && enableAppIdHeader {
+		appIdHeader := CustomerLabel{
+			AppId: inst.appId,
+		}
+		appIdHeaderStr, err := json.Marshal(appIdHeader)
+		if err != nil {
+			wLogger.Errorw("WrapperWrite marshal appIdHeader error", "error", err, "sid", inst.sid, "appId", inst.appId)
+		}
+		streamReq.Metadata = map[string]string{
+			customerHeader: string(appIdHeaderStr),
+		}
 	}
 
 	enableThinking := globalEnableThinking
@@ -812,6 +846,12 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 	if responseFormat.Type != "" {
 		streamReq.ResponseFormat = &responseFormat
+	}
+	if extraParams.FrequencyPenalty != nil {
+		streamReq.FrequencyPenalty = *extraParams.FrequencyPenalty
+	}
+	if extraParams.PresencePenalty != nil {
+		streamReq.PresencePenalty = *extraParams.PresencePenalty
 	}
 
 	openaiMsgs, functions := formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
