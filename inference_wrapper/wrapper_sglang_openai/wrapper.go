@@ -64,6 +64,7 @@ var (
 	reasoningEffort               = "high"
 	enableAppIdHeader      bool   = true // 是否启用 appID 请求级别metadata
 	customerHeader         string = "x-customer-labels"
+	maxStopWords           int    = 16 // 添加全局变量存储最大停止词数
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -176,6 +177,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 		if t, err := strconv.ParseInt(v, 10, 64); err == nil {
 			streamContextTimeoutSeconds = time.Second * time.Duration(t)
 		}
+	}
+	if v, ok := cfg["max_stop_words"]; ok {
+		maxStopWords, _ = strconv.Atoi(v)
 	}
 
 	// 创建日志目录
@@ -493,15 +497,16 @@ func getLocalIP() string {
 
 // wrapperInst 结构体定义
 type wrapperInst struct {
-	usrTag     string
-	sid        string
-	appId      string
-	client     *OpenAIClient
-	stopQ      chan bool
-	firstFrame bool
-	callback   comwrapper.CallBackPtr
-	params     map[string]string
-	active     bool
+	usrTag               string
+	sid                  string
+	appId                string
+	client               *OpenAIClient
+	stopQ                chan bool
+	firstFrame           bool
+	callback             comwrapper.CallBackPtr
+	params               map[string]string
+	active               bool
+	continueFinalMessage bool
 }
 
 // WrapperCreate 插件会话实例创建
@@ -639,10 +644,12 @@ type ExtraParams struct {
 			Strict      bool                   `json:"strict"`
 		} `json:"json_schema,omitempty"`
 	} `json:"response_format,omitempty"`
-	LogitBias        map[string]int `json:"logit_bias,omitempty"`
-	ReasoningEffort  string         `json:"reasoning_effort,omitempty"`
-	FrequencyPenalty *float32       `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float32       `json:"presence_penalty,omitempty"`
+	LogitBias            map[string]int `json:"logit_bias,omitempty"`
+	ReasoningEffort      string         `json:"reasoning_effort,omitempty"`
+	FrequencyPenalty     *float32       `json:"frequency_penalty,omitempty"`
+	PresencePenalty      *float32       `json:"presence_penalty,omitempty"`
+	ContinueFinalMessage bool           `json:"continue_final_message,omitempty"`
+	Stop                 []string       `json:"stop,omitempty"`
 }
 
 // app_Id
@@ -717,6 +724,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		temp = float64(0)
 		mt   = 0
 		tp   = float64(0)
+		stop []string
 	)
 	if tempStr, ok := inst.params["temperature"]; ok {
 		if t, err := strconv.ParseFloat(tempStr, 64); err == nil {
@@ -853,8 +861,22 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	if extraParams.PresencePenalty != nil {
 		streamReq.PresencePenalty = *extraParams.PresencePenalty
 	}
+	if extraParams.ContinueFinalMessage {
+		inst.continueFinalMessage = true
+	}
+	if len(extraParams.Stop) > 0 {
+		if len(extraParams.Stop) > maxStopWords {
+			wLogger.Warnw("WrapperWrite stop words over limit", "stop", extraParams.Stop, "maxStopWords", maxStopWords, "sid", inst.sid)
+			stop = extraParams.Stop[:maxStopWords]
+		} else {
+			stop = extraParams.Stop
+			wLogger.Warnw("WrapperWrite stop words", "stop", extraParams.Stop, "sid", inst.sid)
 
-	openaiMsgs, functions := formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+		}
+
+	}
+
+	openaiMsgs, functions := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 	thinking := false
 	if isReasoningModel {
 		lastMsg := openaiMsgs[len(openaiMsgs)-1]
@@ -865,6 +887,12 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			})
 			thinking = true
 		}
+	}
+	if inst.continueFinalMessage {
+		streamReq.ExtraBody["continue_final_message"] = true
+	}
+	if len(stop) > 0 {
+		streamReq.Stop = stop
 	}
 	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
 	return streamReq, functions, thinking
@@ -1506,13 +1534,20 @@ func parseMessages(prompt string) ([]Message, []openai.FunctionDefinition) {
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
+func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
 	messages, functions := parseMessages(prompt)
 	wLogger.Debugf("formatMessages messages: %v\n, functions:%v", messages, functions)
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
 		return messages, functions
+	}
+
+	lastMessage := &messages[len(messages)-1]
+	if lastMessage.Role == "assistant" {
+		if lastMessage.Prefix != nil && *lastMessage.Prefix {
+			inst.continueFinalMessage = true
+		}
 	}
 
 	// 查找最后一个tool消息
@@ -1649,6 +1684,7 @@ type Message struct {
 	Role         string      `json:"role"`
 	Content      interface{} `json:"content"`
 	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
+	Prefix       *bool       `json:"prefix,omitempty"` // for continue final message
 }
 
 // Tool 工具结构
