@@ -1641,11 +1641,12 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if responseFormat.Type != "" {
 			streamReq.ResponseFormat = &responseFormat
 		}
-
 		if enableThinking {
-			streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
-				"enable_thinking": enableThinking,
-			}
+			inst.thinkingMode = true
+		}
+		streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
+			"enable_thinking": enableThinking,
+			"thinking":        enableThinking,
 		}
 		// 使用协程处理流式请求
 		go inst.StreamOAI(streamReq, v.Status)
@@ -1666,7 +1667,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 		}
 	}
 
-	var lastMessage *Message = messages[len(messages)-1]
+	var lastMessage Message = messages[len(messages)-1]
 
 	if lastMessage.Role == "assistant" {
 		if lastMessage.Prefix != nil && *lastMessage.Prefix {
