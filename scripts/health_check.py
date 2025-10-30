@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import subprocess
+import requests
+import time
+import argparse
+from datetime import datetime
 
-def checkPortAlive() -> bool:
+def checkPortAlive(request_timeout: float = 5.0) -> bool:
     try:
         with open("/home/aiges/.status", "r") as file:
             content = file.read().strip()
@@ -22,13 +26,22 @@ def checkPortAlive() -> bool:
         if ret != 0:
             exit(ret)
         print(f"check sglang addr {ip}:{sglangPort}\n")
-        sglangPortCheckCmd = f"nc -zv {ip} {sglangPort}"
-        ret = subprocess.call(sglangPortCheckCmd, shell=True)
-        if ret != 0:
-            exit(ret)
+        url = f"http://{ip}:{sglangPort}/health"
+
+        formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print("start_time:", formatted)  
+        response = requests.get(url, timeout=request_timeout)
+        print(response)
+        response.raise_for_status()
+        formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print("end_time:", formatted)
     except Exception as e:
         print(str(e))
         exit(-1)
 
 if __name__ == '__main__':
-    checkPortAlive()
+    parser = argparse.ArgumentParser(description="Health check with configurable timeout")
+    parser.add_argument("--timeout", type=float, default=5.0, help="HTTP request timeout in seconds (default: 5.0)")
+    args = parser.parse_args()
+    print(f"request_timeout: {args.timeout}")
+    checkPortAlive(request_timeout=args.timeout)
