@@ -64,7 +64,8 @@ var (
 	reasoningEffort               = "high"
 	enableAppIdHeader      bool   = true // 是否启用 appID 请求级别metadata
 	customerHeader         string = "x-customer-labels"
-	maxStopWords           int    = 16 // 添加全局变量存储最大停止词数
+	maxStopWords           int    = 16    // 添加全局变量存储最大停止词数
+	parallelToolCalls      bool   = false // 添加全局变量存储是否启用并行工具调用
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -318,6 +319,10 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if globalEnableThinkingStr == "false" {
 		globalEnableThinking = false
 	}
+	parallelToolCallsStr := getEnvValue("PARALLEL_TOOL_CALLS")
+	if parallelToolCallsStr == "true" {
+		parallelToolCalls = true
+	}
 
 	// 构建完整的启动命令
 	args := []string{
@@ -536,7 +541,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	return unsafe.Pointer(inst), nil
 }
 
-func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall) (comwrapper.WrapperData, error) {
+func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall, tool_calls []openai.ToolCall) (comwrapper.WrapperData, error) {
 
 	choice := map[string]interface{}{
 		"content":           text,
@@ -546,6 +551,9 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 	}
 	if len(function_call) > 0 {
 		choice["function_call"] = function_call
+	}
+	if len(tool_calls) > 0 {
+		choice["tool_calls"] = tool_calls
 	}
 	result := map[string]interface{}{
 		"choices": []map[string]interface{}{
@@ -599,7 +607,7 @@ func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_
 		responseError(inst, err)
 		return err
 	}
-	content, err := responseContent(status, index, "", "", nil)
+	content, err := responseContent(status, index, "", "", nil, nil)
 	if err != nil {
 		responseError(inst, err)
 		return err
@@ -683,23 +691,23 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 		responseError(inst, err)
 		return err
 	}
-	var toolCalls []openai.FunctionCall
+	var functionCalls []openai.FunctionCall
 	if len(resp.Choices) > 0 && len(resp.Choices[0].Message.ToolCalls) > 0 {
 		for _, v := range resp.Choices[0].Message.ToolCalls {
-			toolCalls = append(toolCalls, openai.FunctionCall{
+			functionCalls = append(functionCalls, openai.FunctionCall{
 				Name:      v.Function.Name,
 				Arguments: v.Function.Arguments,
 			})
 		}
 	}
-	wLogger.Debugf("WrapperWrite function_call toolcalls:%v, sid:%v\n response:%v", toString(toolCalls), inst.sid, toString(resp))
+	wLogger.Debugf("WrapperWrite function_call toolcalls:%v, sid:%v\n response:%v", toString(functionCalls), inst.sid, toString(resp))
 	// 整理结果
 	status := comwrapper.DataEnd
 	openaiContent := resp.Choices[0].Message.Content
 	if openaiContent == "" {
 		openaiContent = " "
 	}
-	content, err := responseContent(status, 0, openaiContent, "", toolCalls)
+	content, err := responseContent(status, 0, openaiContent, "", functionCalls, nil)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
 		responseError(inst, err)
@@ -871,9 +879,40 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		} else {
 			stop = extraParams.Stop
 			wLogger.Warnw("WrapperWrite stop words", "stop", extraParams.Stop, "sid", inst.sid)
-
 		}
+	}
 
+	if toolsStr, ok := inst.params["tools"]; ok {
+		tools := make([]openai.Tool, 0)
+		if err := json.Unmarshal([]byte(toolsStr), &tools); err != nil {
+			wLogger.Errorw("WrapperWrite unmarshal tools error", "error", err, "sid", inst.sid, "tools", toolsStr)
+		}
+		streamReq.Tools = tools
+		if toolChoiceStr, ok := inst.params["tool_choice"]; ok && toolChoiceStr != "" {
+			wLogger.Infow("WrapperWrite toolChoiceStr", "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+			if strings.HasPrefix(toolChoiceStr, "{") {
+				toolChoice := openai.ToolChoice{}
+				err := json.Unmarshal([]byte(toolChoiceStr), &toolChoice)
+				if err != nil {
+					wLogger.Errorw("WrapperWrite unmarshal toolChoiceStr error", "error", err, "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+				}
+				streamReq.ToolChoice = toolChoice
+			} else {
+				toolChoiceStr = strings.ReplaceAll(toolChoiceStr, "\"", "")
+				streamReq.ToolChoice = toolChoiceStr
+			}
+		} else {
+			streamReq.ToolChoice = "auto"
+		}
+		if parallelToolCallsStr, ok := inst.params["parallel_tool_calls"]; ok {
+			if parallelToolCallsStr == "true" {
+				streamReq.ParallelToolCalls = true
+			} else {
+				streamReq.ParallelToolCalls = false
+			}
+		} else {
+			streamReq.ParallelToolCalls = parallelToolCalls
+		}
 	}
 
 	openaiMsgs, functions := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
@@ -979,7 +1018,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 			status = comwrapper.DataContinue
 			// 首帧返回空
-			firstFrameContent, err := responseContent(status, index, "", "", nil)
+			firstFrameContent, err := responseContent(status, index, "", "", nil, nil)
 			if err != nil {
 				wLogger.Errorw("WrapperWrite error fisrt callback", "error", err, "sid", inst.sid)
 				responseError(inst, err)
@@ -1029,7 +1068,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						chunk_content := response.Choices[0].Delta.ReasoningContent
 						wLogger.Debugf("WrapperWrite stream response reasoning index:%v, status:%v, chunk_content:%v, sid:%v\n", index, status, chunk_content, inst.sid)
 						fullContent += chunk_content
-						content, err := responseContent(status, index, "", chunk_content, nil)
+						content, err := responseContent(status, index, "", chunk_content, nil, nil)
 						if err != nil {
 							wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
 							responseError(inst, err)
@@ -1050,7 +1089,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							chunks := strings.Split(chunk_content, R1_THINK_START)
 							reasoning_start_chunk := chunks[1]
 							if reasoning_start_chunk != "" {
-								reasoning_start_chunk_content, err := responseContent(status, index, "", reasoning_start_chunk, nil)
+								reasoning_start_chunk_content, err := responseContent(status, index, "", reasoning_start_chunk, nil, nil)
 								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_start_chunk:%v, sid:%v\n", index, status, reasoning_start_chunk, inst.sid)
 								if err != nil {
 									wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
@@ -1074,7 +1113,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							answer_start_chunk := chunks[1]
 
 							if reasoning_last_chunk != "" {
-								reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk, nil)
+								reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk, nil, nil)
 								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_last_chunk:%v, sid:%v\n", index, status, reasoning_last_chunk, inst.sid)
 								if err != nil {
 									wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
@@ -1090,7 +1129,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							}
 
 							if answer_start_chunk != "" {
-								answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "", nil)
+								answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "", nil, nil)
 								if err != nil {
 									wLogger.Errorw("WrapperWrite answer_start_chunk error", "error", err, "sid", inst.sid)
 									responseError(inst, err)
@@ -1113,14 +1152,14 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						// pre_chunk_content = chunk_content
 
 						if thinking {
-							content, err = responseContent(status, index, "", chunk_content, nil)
+							content, err = responseContent(status, index, "", chunk_content, nil, nil)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite thinking content error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
 								return
 							}
 						} else {
-							content, err = responseContent(status, index, chunk_content, "", nil)
+							content, err = responseContent(status, index, chunk_content, "", nil, nil)
 							if err != nil {
 								wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
 								responseError(inst, err)
@@ -1134,6 +1173,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 							return
 						}
 						index += 1
+					} else if len(response.Choices) > 0 && len(response.Choices[0].Delta.ToolCalls) > 0 {
+						tool_calls := response.Choices[0].Delta.ToolCalls
+						wLogger.Debugf("WrapperWrite stream response tool calls think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, toString(tool_calls), inst.sid)
+						content, err := responseContent(status, index, "", "", nil, tool_calls)
+						if err != nil {
+							wLogger.Errorw("WrapperWrite tool_calls error", "error", err, "sid", inst.sid)
+							return
+						}
+						responseData = append(responseData, content)
+						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
+							wLogger.Errorw("WrapperWrite content callback error", "error", err, "sid", inst.sid)
+							return
+						}
+						index += 1
+
 					} else if response.Usage != nil {
 						// 创建usage数据结构
 						promptTokensLen = response.Usage.PromptTokens
