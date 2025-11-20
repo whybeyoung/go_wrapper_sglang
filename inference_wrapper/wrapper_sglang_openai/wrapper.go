@@ -547,7 +547,9 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 		"content":           text,
 		"reasoning_content": resoning_content,
 		"index":             0,
-		"role":              "assistant",
+	}
+	if index == 0 {
+		choice["role"] = "assistant"
 	}
 	if len(function_call) > 0 {
 		choice["function_call"] = function_call
@@ -808,7 +810,9 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		"sid", inst.sid,
 		"temperature", temp,
 		"maxTokens", mt,
-		"topP", tp)
+		"topP", tp,
+		"param", inst.params,
+	)
 	if mt > 0 {
 		streamReq.MaxTokens = mt
 	}
@@ -926,7 +930,6 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 
 	if toolsStr, ok := inst.params["tools"]; ok {
-		streamReq.Stream = false
 		tools := make([]openai.Tool, 0)
 		if err := json.Unmarshal([]byte(toolsStr), &tools); err != nil {
 			wLogger.Errorw("WrapperWrite unmarshal tools error", "error", err, "sid", inst.sid, "tools", toolsStr)
@@ -987,7 +990,6 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 // WrapperWrite 数据写入
 func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) {
 	inst := (*wrapperInst)(hdl)
-	wLogger.Infof("WrapperWrite inst:%v, req:%v\n", toString(inst), toString(req))
 	if !inst.active {
 		wLogger.Warnw("WrapperWrite called on inactive instance", "sid", inst.sid)
 		return fmt.Errorf("instance is not active")
