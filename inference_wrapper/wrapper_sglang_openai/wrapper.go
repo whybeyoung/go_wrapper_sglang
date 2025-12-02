@@ -660,6 +660,7 @@ type ExtraParams struct {
 	PresencePenalty      *float32       `json:"presence_penalty,omitempty"`
 	ContinueFinalMessage bool           `json:"continue_final_message,omitempty"`
 	Stop                 []string       `json:"stop,omitempty"`
+	SkipSpecialTokens    *bool          `json:"skip_special_tokens,omitempty"`
 }
 
 // app_Id
@@ -918,6 +919,9 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 	if extraParams.ContinueFinalMessage {
 		inst.continueFinalMessage = true
+	}
+	if extraParams.SkipSpecialTokens != nil {
+		streamReq.ExtraBody["skip_special_tokens"] = *extraParams.SkipSpecialTokens
 	}
 	if len(extraParams.Stop) > 0 {
 		if len(extraParams.Stop) > maxStopWords {
