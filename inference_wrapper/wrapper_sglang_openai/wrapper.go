@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,8 @@ var (
 	customerHeader         string = "x-customer-labels"
 	maxStopWords           int    = 16    // 添加全局变量存储最大停止词数
 	parallelToolCalls      bool   = false // 添加全局变量存储是否启用并行工具调用
+	addWebsearchContent    bool   = false // 工具调用是否添加assitant搜索内容，v32格式严格要求
+	isMultiContent         bool   = false // vl
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -215,6 +218,15 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if isReasoningModelStr == "true" {
 		isReasoningModel = true
 	}
+	addWebSearchContent := getEnvValue("ADD_WEBSEARCH_CONTENT")
+	if addWebSearchContent == "true" {
+		addWebsearchContent = true
+	}
+
+	isMultiContentStr := getEnvValue("IS_MULTI_CONTENT")
+	if isMultiContentStr == "true" {
+		isMultiContent = true
+	}
 
 	reasoningEffortStr := getEnvValue("REASONING_EFFORT")
 	if reasoningEffortStr != "" {
@@ -313,7 +325,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		if finetuneType == "" {
 			finetuneType = "lora"
 		}
-		extraArgs += loraSetting
+		extraArgs = extraArgs + " " + loraSetting
 	}
 	globalEnableThinkingStr := getEnvValue("GLOBAL_ENABLE_THINKING")
 	if globalEnableThinkingStr == "false" {
@@ -772,7 +784,7 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 	}
 	return nil
 }
-func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.ChatCompletionRequest, []openai.FunctionDefinition, bool) {
+func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.ChatCompletionRequest, []openai.FunctionDefinition, bool, error) {
 	// 从params中获取参数, 否则不传
 	var (
 		temp = float64(0)
@@ -987,8 +999,12 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	if len(stop) > 0 {
 		streamReq.Stop = stop
 	}
-	streamReq.Messages = convertToOpenAIMessages(openaiMsgs)
-	return streamReq, functions, thinking
+	messages, err := convertToOpenAIMessages(openaiMsgs)
+	if err != nil {
+		wLogger.Errorw("Failed to convert messages", "error", err, "sid", inst.sid)
+	}
+	streamReq.Messages = messages
+	return streamReq, functions, thinking, err
 }
 
 // WrapperWrite 数据写入
@@ -1023,7 +1039,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		wLogger.Infow("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
 
-		streamReq, functions, thinking := buildStreamReq(inst, v)
+		streamReq, functions, thinking, err := buildStreamReq(inst, v)
+		if err != nil {
+			wLogger.Errorw("Failed to build stream request", "error", err, "sid", inst.sid)
+			return err
+		}
 
 		if !streamReq.Stream {
 			return nonStreamingRequest(inst, streamReq)
@@ -1733,6 +1753,30 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	currentDate := fmt.Sprintf("%d年%02d月%02d日星期%s",
 		now.Year(), now.Month(), now.Day(), weekdays[now.Weekday()])
 
+	addIndex := -1
+	if addWebsearchContent {
+		// 查找最后一个role=tool，并且前一条消息不是role=assitant 是需要插入一条消息
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "tool" {
+				for messages[i].Role == "tool" && i > 0 && messages[i-1].Role == "tool" {
+					i--
+				}
+				addIndex = i
+
+				if messages[addIndex-1].Role != "assistant" {
+					newMessages := make([]Message, 0, len(messages)+1)
+					newMessages = append(newMessages, messages[:addIndex]...)
+					newMessages = append(newMessages, Message{
+						Role: "assistant",
+					})
+					newMessages = append(newMessages, messages[addIndex:]...)
+					messages = newMessages
+					break
+				}
+			}
+
+		}
+	}
 	// 查找最后一个用户消息并更新其内容
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -1767,7 +1811,26 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 				wLogger.Errorw("Failed to execute template", "error", err)
 				return messages, functions
 			}
-
+			if addWebsearchContent && addIndex != -1 {
+				args := map[string]string{
+					"content": messages[i].Content.(string),
+				}
+				argsJSON, err := json.Marshal(args)
+				if err != nil {
+					wLogger.Errorw("Failed to marshal tool call arguments", "error", err)
+					return messages, functions
+				}
+				messages[addIndex].ToolCalls = []openai.ToolCall{
+					{
+						ID:   "tool_calls",
+						Type: "function",
+						Function: openai.FunctionCall{
+							Name:      "web_search",
+							Arguments: string(argsJSON),
+						},
+					},
+				}
+			}
 			messages[i].Content = result.String()
 			break
 		}
@@ -1813,10 +1876,12 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role         string      `json:"role"`
-	Content      interface{} `json:"content"`
-	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
-	Prefix       *bool       `json:"prefix,omitempty"` // for continue final message
+	Role         string            `json:"role"`
+	Content      interface{}       `json:"content"`
+	ShowRefLabel *bool             `json:"show_ref_label,omitempty"`
+	Prefix       *bool             `json:"prefix,omitempty"` // for continue final message
+	ToolCalls    []openai.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID   string            `json:"tool_call_id,omitempty"`
 }
 
 // Tool 工具结构
@@ -1869,11 +1934,44 @@ func monitorSubprocess(cmd *exec.Cmd) {
 }
 
 // convertToOpenAIMessages 将自定义Message类型转换为OpenAI的ChatCompletionMessage类型
-func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage {
+func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage, error) {
 	openAIMessages := make([]openai.ChatCompletionMessage, len(messages))
 	for i, msg := range messages {
+		openAIMessages[i] = openai.ChatCompletionMessage{
+			Role:       msg.Role,
+			ToolCalls:  msg.ToolCalls,
+			ToolCallID: msg.ToolCallID,
+		}
 		content := ""
-		if msg.Content != nil {
+		if isMultiContent {
+			multiContent := make([]openai.ChatMessagePart, 0)
+			wLogger.Infow("convertToOpenAIMessages multi content", "content", msg.Content, "contentType", fmt.Sprintf("%T", msg.Content))
+
+			// 使用反射检查是否为切片类型
+			contentValue := reflect.ValueOf(msg.Content)
+			if contentValue.Kind() == reflect.Slice {
+				// 如果是切片，遍历每个元素并转换为ChatMessagePart
+				for i := 0; i < contentValue.Len(); i++ {
+					item := contentValue.Index(i).Interface()
+					// 将item序列化为JSON，然后反序列化为ChatMessagePart
+					jsonBytes, marshalErr := json.Marshal(item)
+					if marshalErr != nil {
+						wLogger.Errorw("Failed to marshal content item", "error", marshalErr, "item_type", fmt.Sprintf("%T", item))
+						return nil, fmt.Errorf("failed to marshal content item: %v", marshalErr)
+					}
+					var part openai.ChatMessagePart
+					if unmarshalErr := json.Unmarshal(jsonBytes, &part); unmarshalErr != nil {
+						wLogger.Errorw("Failed to unmarshal content item", "error", unmarshalErr, "item", string(jsonBytes))
+						return nil, fmt.Errorf("failed to unmarshal content item: %v", unmarshalErr)
+					}
+					multiContent = append(multiContent, part)
+				}
+				openAIMessages[i].MultiContent = multiContent
+			} else {
+				wLogger.Errorw("Failed to unmarshal multi content", "error", nil, "content_type", fmt.Sprintf("%T", msg.Content), "content_kind", contentValue.Kind().String())
+				return nil, fmt.Errorf("unsupport multi content type: %T (expected slice)", msg.Content)
+			}
+		} else if msg.Content != nil {
 			switch v := msg.Content.(type) {
 			case string:
 				content = v
@@ -1883,13 +1981,10 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 					content = string(jsonBytes)
 				}
 			}
-		}
-		openAIMessages[i] = openai.ChatCompletionMessage{
-			Role:    msg.Role,
-			Content: content,
+			openAIMessages[i].Content = content
 		}
 	}
-	return openAIMessages
+	return openAIMessages, nil
 }
 
 // WarmupPrompt 预热请求数据结构
