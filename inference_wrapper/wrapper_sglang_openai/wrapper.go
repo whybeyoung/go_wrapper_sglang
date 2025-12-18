@@ -1212,7 +1212,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 									return
 								}
 								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, answer_start_chunk:%v, sid:%v\n", index, status, answer_start_chunk, inst.sid)
-								responseData[0] = answer_start_chunk_content
+								// Reset responseData and append the new content
+								responseData = []comwrapper.WrapperData{answer_start_chunk_content}
 								if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 									wLogger.Errorw("WrapperWrite answer_start_chunk_content callback error", "error", err, "sid", inst.sid)
 									return
