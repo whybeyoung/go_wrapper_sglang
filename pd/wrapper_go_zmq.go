@@ -60,10 +60,11 @@ var (
 	enableJsonModePostProcess     bool = true // 是否进行json模式后处理
 	enableAppIdHeader             bool = true // 是否启用 appID 请求级别metadata
 	serviceName                   string
-	customerHeader                string = "x-customer-labels"
+	customerHeader                string = "x-custom-labels"
 
 	// extra body
-	continueFinalMessage bool = false // 是否继续最终消息
+	continueFinalMessage bool           = false // 是否继续最终消息
+	logitBias            map[string]int = nil   // 是否继续最终消息
 )
 
 const JSONMODE_SYS_PROMPT = ` "请生成纯JSON，不要加 json, 还有三反引号或其他 Markdown 标记"`
@@ -125,6 +126,7 @@ type wrapperInst struct {
 	params               map[string]string
 	active               bool
 	continueFinalMessage bool
+	logitBias            map[string]int
 	SessionManager       *SessionManager
 	Stream               *openai.ChatCompletionStream
 	// StopStreamChan      chan bool
@@ -194,6 +196,7 @@ func ParseMetrics(text string) map[string]*Metric {
 	lines := strings.Split(text, "\n")
 	metrics := make(map[string]*Metric, len(lines))
 	var currentMetric *Metric
+	var totalValue float64
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -206,17 +209,33 @@ func ParseMetrics(text string) map[string]*Metric {
 			continue
 
 		case strings.HasPrefix(line, "# TYPE"):
+			// 如果之前有指标，先保存累计值
+			if currentMetric != nil {
+				currentMetric.Content = append(currentMetric.Content, ContentItem{
+					Key:   currentMetric.Name,
+					Value: totalValue,
+				})
+			}
+
 			parts := strings.Fields(line)
 			if len(parts) < 4 {
 				continue
 			}
 
-			currentMetric = &Metric{
-				Name:    parts[2],
-				Type:    parts[3],
-				Content: []ContentItem{},
+			metricName := parts[2]
+			// 如果指标已存在，继续使用现有的，否则创建新的
+			if existingMetric, exists := metrics[metricName]; exists {
+				currentMetric = existingMetric
+			} else {
+				currentMetric = &Metric{
+					Name:    metricName,
+					Type:    parts[3],
+					Content: []ContentItem{},
+				}
+				metrics[metricName] = currentMetric
 			}
-			metrics[parts[2]] = currentMetric
+			// 重置累计值
+			totalValue = 0
 
 		default:
 			if currentMetric == nil {
@@ -229,12 +248,18 @@ func ParseMetrics(text string) map[string]*Metric {
 					// 解析失败你可以选择跳过或赋0
 					val = 0
 				}
-				currentMetric.Content = append(currentMetric.Content, ContentItem{
-					Key:   keyValue[0],
-					Value: val,
-				})
+				// 累加所有相同指标名称的值
+				totalValue += val
 			}
 		}
+	}
+
+	// 处理最后一个指标
+	if currentMetric != nil {
+		currentMetric.Content = append(currentMetric.Content, ContentItem{
+			Key:   currentMetric.Name,
+			Value: totalValue,
+		})
 	}
 
 	return metrics
@@ -429,7 +454,7 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 			metricName = generation_token_metric
 		}
 		if sglangMetrics != nil {
-			if metric, ok := sglangMetrics[metricName]; ok {
+			if metric, ok := sglangMetrics[metricName]; ok && len(metric.Content) > 0 {
 				lastMetricValue = newMetricValue
 				newMetricValue = metric.Content[0].Value
 				delta := newMetricValue - lastMetricValue
@@ -820,6 +845,7 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 		SingleOutChanClosed:  false, // 使用大写开头的字段名
 		appId:                appId,
 		continueFinalMessage: continueFinalMessage,
+		logitBias:            logitBias,
 	}
 	if inst.SessionManager != nil {
 		inst.SessionManager.AddRequest(inst.sid, inst) // 传入 inst 指针
@@ -903,9 +929,9 @@ func getLocalIP() string {
 
 func (inst *wrapperInst) checkPrefillFirstKeepAlive(ttft time.Duration, outStr string) {
 	/*
-		1. Prefill 发送 keepalive_down 信号
-		2. 设置 inst.active 为 false
-		3. 返回
+	   1. Prefill 发送 keepalive_down 信号
+	   2. 设置 inst.active 为 false
+	   3. 返回
 	*/
 	keepAliveData := comwrapper.WrapperData{
 		Key:      "__keepalive_down",
@@ -1025,7 +1051,7 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 						chunkContent = ""
 					}
 				}
-				if chunkContent == "</think>" {
+				if strings.Contains(chunkContent, "</think>") {
 					inst.thinkingMode = false
 					chunkContent = ""
 				}
@@ -1413,7 +1439,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// time.Sleep(time.Millisecond * 1)
 
 		// if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{kvContent, messagesContent, keepAliveBegin}, nil); err != nil {
-		// 	wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+		//      wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
 		// }
 		// wLogger.Infow("WrapperWrite sent kv_info, messages and keepalive_down begin", "sid", inst.sid)
 
@@ -1511,13 +1537,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if extraParams.ContinueFinalMessage {
 			inst.continueFinalMessage = true
 		}
+		if extraParams.LogitBias != nil {
+			inst.logitBias = extraParams.LogitBias
+		}
 		wLogger.Infow("WrapperWrite request parameters",
 			"sid", inst.sid,
 			"appId", inst.appId,
 			"temperature", temperature,
 			"maxTokens", maxTokens,
 			"stop", stop,
-			"continueFinalMessage", inst.continueFinalMessage)
+			"continueFinalMessage", inst.continueFinalMessage,
+			"logitBias", inst.logitBias,
+		)
 
 		// 创建流式请求
 		formatResult := inst.formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
@@ -1607,7 +1638,9 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if inst.continueFinalMessage {
 			streamReq.ExtraBody["continue_final_message"] = true
 		}
-
+		if inst.logitBias != nil {
+			streamReq.LogitBias = inst.logitBias
+		}
 		// 设定 appID 请求级别，用于统计
 		if inst.appId != "" && enableAppIdHeader {
 			appIdHeader := CustomerLabel{
