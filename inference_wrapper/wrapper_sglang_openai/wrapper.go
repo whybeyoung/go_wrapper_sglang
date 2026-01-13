@@ -69,6 +69,7 @@ var (
 	parallelToolCalls      bool   = false // 添加全局变量存储是否启用并行工具调用
 	addWebsearchContent    bool   = false // 工具调用是否添加assitant搜索内容，v32格式严格要求
 	isMultiContent         bool   = false // vl
+	enableSglangMetrics    bool   = true
 )
 
 var traceFunc func(usrTag string, key string, value string) (code int)
@@ -335,6 +336,10 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if parallelToolCallsStr == "true" {
 		parallelToolCalls = true
 	}
+	enableSglangMetricsStr := getEnvValue("ENABLE_SGLANG_METRICS")
+	if enableSglangMetricsStr == "false" {
+		enableSglangMetrics = false
+	}
 
 	// 构建完整的启动命令
 	args := []string{
@@ -412,11 +417,14 @@ func WrapperInit(cfg map[string]string) (err error) {
 	patchResMap = make(map[string]PatchRes)
 	patchIdInnerPatchIdMap = make(map[string]string)
 
-	err = gwsUtils.UpdatePodMetricsPort(httpServerPort)
-	if err != nil {
-		wLogger.Errorw("updatePodMetricsPort failed", "error", err)
-		return err
+	if enableSglangMetrics {
+		err = gwsUtils.UpdatePodMetricsPort(httpServerPort)
+		if err != nil {
+			wLogger.Errorw("updatePodMetricsPort failed", "error", err)
+			return err
+		}
 	}
+
 	// 获取是否启用 appID 请求级别metadata
 	enableAppIdHeaderStr := os.Getenv("ENABLE_APP_ID_HEADER")
 	if enableAppIdHeaderStr == "false" {
@@ -427,46 +435,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 	wLogger.Debugw("WrapperInit successful")
 	return
-}
-
-func updatePodMetricsPort() {
-
-}
-
-func reportSglangMetrics(serverMetricURL string) {
-	wLogger.Debugw("sglang metric start")
-	httpClient := http.Client{
-		Timeout: time.Second,
-	}
-	sleepInterval := time.Second
-	for {
-
-		resp, err := httpClient.Get(serverMetricURL)
-		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
-			time.Sleep(sleepInterval)
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
-			time.Sleep(sleepInterval)
-			continue
-		}
-		wLogger.Debugw("sglang metric", "resp", string(body))
-		sglangMetrics := gwsUtils.ParseMetrics(string(body))
-		res := make(map[string]string, len(sglangMetrics))
-		for k, v := range sglangMetrics {
-			str, _ := json.Marshal(v)
-			res[k] = string(str)
-		}
-		err = LbExtraFunc(res)
-		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
-		}
-		time.Sleep(sleepInterval)
-	}
 }
 
 // waitServerReady 等待服务器就绪
