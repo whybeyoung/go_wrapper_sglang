@@ -521,8 +521,8 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	return unsafe.Pointer(inst), nil
 }
 
-func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall, tool_calls []openai.ToolCall) (comwrapper.WrapperData, error) {
-
+func responseContent(status comwrapper.DataStatus, index int, text string, resoning_content string, function_call []openai.FunctionCall, tool_calls []openai.ToolCall, finish_reason string) (comwrapper.WrapperData, error) {
+	wLogger.Debugf("WrapperWrite responseContent status:%v, index:%v, text:%v, resoning_content:%v, function_call:%v, tool_calls:%v, finish_reason:%v\n", status, index, text, resoning_content, function_call, tool_calls, finish_reason)
 	choice := map[string]interface{}{
 		"content":           text,
 		"reasoning_content": resoning_content,
@@ -536,6 +536,9 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 	}
 	if len(tool_calls) > 0 {
 		choice["tool_calls"] = tool_calls
+	}
+	if finish_reason != "" {
+		choice["finish_reason"] = finish_reason
 	}
 	result := map[string]interface{}{
 		"choices": []map[string]interface{}{
@@ -555,12 +558,18 @@ func responseContent(status comwrapper.DataStatus, index int, text string, reson
 	}, err
 }
 
-func responseUsage(status comwrapper.DataStatus, prompt_token, completion_token int) (comwrapper.WrapperData, error) {
+func responseUsage(status comwrapper.DataStatus, usage *openai.Usage) (comwrapper.WrapperData, error) {
 	result := map[string]interface{}{
-		"prompt_tokens":     prompt_token,
-		"completion_tokens": completion_token,
-		"total_tokens":      prompt_token + completion_token,
+		"prompt_tokens":     usage.PromptTokens,
+		"completion_tokens": usage.CompletionTokens,
+		"total_tokens":      usage.TotalTokens,
 		"question_tokens":   4, // 无意义，未使用默认值4
+	}
+	if usage.PromptTokensDetails != nil {
+		result["prompt_tokens_details"] = usage.PromptTokensDetails
+	}
+	if usage.CompletionTokensDetails != nil {
+		result["completion_tokens_details"] = usage.CompletionTokensDetails
 	}
 	data, err := json.Marshal(result)
 
@@ -582,20 +591,20 @@ func responseError(inst *wrapperInst, err error) {
 	}
 }
 
-func responseEnd(inst *wrapperInst, index int, prompt_tokens_len, result_tokens_len int) error {
+func responseEnd(inst *wrapperInst, index int, usage *openai.Usage, finish_reason string) error {
 	status := comwrapper.DataEnd
-	usageWrapperData, err := responseUsage(status, prompt_tokens_len, result_tokens_len)
+	usageWrapperData, err := responseUsage(status, usage)
 	if err != nil {
 		responseError(inst, err)
 		return err
 	}
-	content, err := responseContent(status, index, "", "", nil, nil)
+	content, err := responseContent(status, index, "", "", nil, nil, finish_reason)
 	if err != nil {
 		responseError(inst, err)
 		return err
 	}
 	responseData := []comwrapper.WrapperData{content, usageWrapperData}
-	wLogger.Infof("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v, sid:%v\n", index, prompt_tokens_len, result_tokens_len, responseData, inst.sid)
+	wLogger.Infof("WrapperWrite stream responseEnd index:%v, prompt_tokens_len:%v, result_tokens_len:%v,responseData:%v, sid:%v\n", index, usage.PromptTokens, usage.CompletionTokens, responseData, inst.sid)
 	if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
 		wLogger.Errorw("WrapperWrite end callback error", "error", err, "sid", inst.sid)
 		return err
@@ -671,14 +680,18 @@ func nonStreamingRequest(inst *wrapperInst, req *openai.ChatCompletionRequest) e
 	// 整理结果
 	status := comwrapper.DataEnd
 	toolCalls := resp.Choices[0].Message.ToolCalls
-	content, err := responseContent(status, 0, resp.Choices[0].Message.Content, resp.Choices[0].Message.ReasoningContent, nil, toolCalls)
+	var finishReason string
+	if len(resp.Choices) > 0 && resp.Choices[0].FinishReason != "" {
+		finishReason = string(resp.Choices[0].FinishReason)
+	}
+	content, err := responseContent(status, 0, resp.Choices[0].Message.Content, resp.Choices[0].Message.ReasoningContent, nil, toolCalls, finishReason)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
 		responseError(inst, err)
 		return err
 	}
 
-	usage, err := responseUsage(status, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	usage, err := responseUsage(status, &resp.Usage)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
 		responseError(inst, err)
@@ -733,14 +746,18 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 	if openaiContent == "" {
 		openaiContent = " "
 	}
-	content, err := responseContent(status, 0, openaiContent, "", functionCalls, nil)
+	var finishReason string
+	if len(resp.Choices) > 0 && resp.Choices[0].FinishReason != "" {
+		finishReason = string(resp.Choices[0].FinishReason)
+	}
+	content, err := responseContent(status, 0, openaiContent, "", functionCalls, nil, finishReason)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
 		responseError(inst, err)
 		return err
 	}
 
-	usage, err := responseUsage(status, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	usage, err := responseUsage(status, &resp.Usage)
 	if err != nil {
 		wLogger.Errorw("WrapperWrite error function_calls callback", "error", err, "sid", inst.sid)
 		responseError(inst, err)
@@ -1062,7 +1079,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 			status = comwrapper.DataContinue
 			// 首帧返回空
-			firstFrameContent, err := responseContent(status, index, "", "", nil, nil)
+			firstFrameContent, err := responseContent(status, index, "", "", nil, nil, "")
 			if err != nil {
 				wLogger.Errorw("WrapperWrite error fisrt callback", "error", err, "sid", inst.sid)
 				responseError(inst, err)
@@ -1074,6 +1091,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				return
 			}
 			index += 1
+			var finish_reason string // 需要放在最后一帧里
 			//status = comwrapper.DataContinue
 			for {
 				select {
@@ -1108,127 +1126,104 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					if index == 1 {
 						wLogger.Infow("WrapperWrite content first frame content", "response", toString(response), "sid", inst.sid)
 					}
-					if len(response.Choices) > 0 && response.Choices[0].Delta.ReasoningContent != "" {
-						chunk_content := response.Choices[0].Delta.ReasoningContent
-						wLogger.Debugf("WrapperWrite stream response reasoning index:%v, status:%v, chunk_content:%v, sid:%v\n", index, status, chunk_content, inst.sid)
-						fullContent += chunk_content
-						content, err := responseContent(status, index, "", chunk_content, nil, nil)
-						if err != nil {
-							wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
-							responseError(inst, err)
-							return
-						}
-						if err = inst.callback(inst.usrTag, []comwrapper.WrapperData{content}, nil); err != nil {
-							wLogger.Errorw("WrapperWrite reasoning callback error", "error", err, "sid", inst.sid)
-							return
-						}
-						index += 1
-					} else if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
-						var content comwrapper.WrapperData
-						chunk_content := response.Choices[0].Delta.Content
-						fullContent += chunk_content
-						if index == 1 && strings.HasPrefix(chunk_content, R1_THINK_START) {
-							// 出现内容是 <think>Emm
-							thinking = true
-							chunks := strings.Split(chunk_content, R1_THINK_START)
-							reasoning_start_chunk := chunks[1]
-							if reasoning_start_chunk != "" {
-								reasoning_start_chunk_content, err := responseContent(status, index, "", reasoning_start_chunk, nil, nil)
-								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_start_chunk:%v, sid:%v\n", index, status, reasoning_start_chunk, inst.sid)
-								if err != nil {
-									wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
-									responseError(inst, err)
-									return
+					if len(response.Choices) > 0 {
+						var (
+							content           string
+							reasoning_content string
+							// finishReason      string
+							tool_calls []openai.ToolCall
+						)
+						if response.Choices[0].Delta.ReasoningContent != "" {
+							reasoning_content = response.Choices[0].Delta.ReasoningContent
+						} else if response.Choices[0].Delta.Content != "" {
+							// var content comwrapper.WrapperData
+							chunk_content := response.Choices[0].Delta.Content
+							fullContent += chunk_content
+							if index == 1 && strings.HasPrefix(chunk_content, R1_THINK_START) {
+								// 出现内容是 <think>Emm
+								thinking = true
+								chunks := strings.Split(chunk_content, R1_THINK_START)
+								reasoning_start_chunk := chunks[1]
+								if reasoning_start_chunk != "" {
+									reasoning_start_chunk_content, err := responseContent(status, index, "", reasoning_start_chunk, nil, nil, "")
+									wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_start_chunk:%v, sid:%v\n", index, status, reasoning_start_chunk, inst.sid)
+									if err != nil {
+										wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
+										responseError(inst, err)
+										return
+									}
+									responseData = append(responseData, reasoning_start_chunk_content)
+									if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
+										wLogger.Errorw("WrapperWrite reasoning_start_chunk_content callback error", "error", err, "sid", inst.sid)
+										return
+									}
+									index += 1
 								}
-								responseData = append(responseData, reasoning_start_chunk_content)
-								if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-									wLogger.Errorw("WrapperWrite reasoning_start_chunk_content callback error", "error", err, "sid", inst.sid)
-									return
-								}
-								index += 1
+								continue
 							}
+							if strings.Contains(chunk_content, R1_THINK_END) {
+								// content的内容是</think>，有可能出来2帧
+								thinking = false
+								chunks := strings.Split(chunk_content, R1_THINK_END)
+								reasoning_last_chunk := chunks[0]
+								answer_start_chunk := chunks[1]
+
+								if reasoning_last_chunk != "" {
+									reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk, nil, nil, "")
+									wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_last_chunk:%v, sid:%v\n", index, status, reasoning_last_chunk, inst.sid)
+									if err != nil {
+										wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
+										responseError(inst, err)
+										return
+									}
+									responseData = append(responseData, reasoning_last_chunk_content)
+									if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
+										wLogger.Errorw("WrapperWrite reasoning_last_chunk_content callback error", "error", err, "sid", inst.sid)
+										return
+									}
+									index += 1
+								}
+
+								if answer_start_chunk != "" {
+									answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "", nil, nil, "")
+									if err != nil {
+										wLogger.Errorw("WrapperWrite answer_start_chunk error", "error", err, "sid", inst.sid)
+										responseError(inst, err)
+										return
+									}
+									wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, answer_start_chunk:%v, sid:%v\n", index, status, answer_start_chunk, inst.sid)
+									// Reset responseData and append the new content
+									responseData = []comwrapper.WrapperData{answer_start_chunk_content}
+									if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
+										wLogger.Errorw("WrapperWrite answer_start_chunk_content callback error", "error", err, "sid", inst.sid)
+										return
+									}
+									index += 1
+								}
+								continue
+							}
+
+							if thinking {
+								reasoning_content = chunk_content
+							} else {
+								content = chunk_content
+							}
+						} else if len(response.Choices[0].Delta.ToolCalls) > 0 {
+							tool_calls = response.Choices[0].Delta.ToolCalls
+
+						} else if response.Choices[0].FinishReason != "" {
+							wLogger.Debugf("WrapperWrite stream response finish reason index:%v, status:%v, finish reason:%v, sid:%v\n", index, status, response.Choices[0].FinishReason, inst.sid)
+							finish_reason = string(response.Choices[0].FinishReason)
 							continue
 						}
-						if strings.Contains(chunk_content, R1_THINK_END) {
-							// content的内容是</think>，有可能出来2帧
-							thinking = false
-							chunks := strings.Split(chunk_content, R1_THINK_END)
-							reasoning_last_chunk := chunks[0]
-							answer_start_chunk := chunks[1]
-
-							if reasoning_last_chunk != "" {
-								reasoning_last_chunk_content, err := responseContent(status, index, "", reasoning_last_chunk, nil, nil)
-								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, reasoning_last_chunk:%v, sid:%v\n", index, status, reasoning_last_chunk, inst.sid)
-								if err != nil {
-									wLogger.Errorw("WrapperWrite reasoning_last_chunk error", "error", err, "sid", inst.sid)
-									responseError(inst, err)
-									return
-								}
-								responseData = append(responseData, reasoning_last_chunk_content)
-								if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-									wLogger.Errorw("WrapperWrite reasoning_last_chunk_content callback error", "error", err, "sid", inst.sid)
-									return
-								}
-								index += 1
-							}
-
-							if answer_start_chunk != "" {
-								answer_start_chunk_content, err := responseContent(status, index, answer_start_chunk, "", nil, nil)
-								if err != nil {
-									wLogger.Errorw("WrapperWrite answer_start_chunk error", "error", err, "sid", inst.sid)
-									responseError(inst, err)
-									return
-								}
-								wLogger.Debugf("WrapperWrite stream response index:%v, status:%v, answer_start_chunk:%v, sid:%v\n", index, status, answer_start_chunk, inst.sid)
-								// Reset responseData and append the new content
-								responseData = []comwrapper.WrapperData{answer_start_chunk_content}
-								if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-									wLogger.Errorw("WrapperWrite answer_start_chunk_content callback error", "error", err, "sid", inst.sid)
-									return
-								}
-								index += 1
-							}
-							continue
-						}
-						// if chunk_content == GPT_THINK_END_FINAL && pre_chunk_content == GPT_THINK_END_ASSISTANT && thinking {
-						// 	thinking = false
-						// 	continue
-						// }
-						// pre_chunk_content = chunk_content
-
-						if thinking {
-							content, err = responseContent(status, index, "", chunk_content, nil, nil)
-							if err != nil {
-								wLogger.Errorw("WrapperWrite thinking content error", "error", err, "sid", inst.sid)
-								responseError(inst, err)
-								return
-							}
-						} else {
-							content, err = responseContent(status, index, chunk_content, "", nil, nil)
-							if err != nil {
-								wLogger.Errorw("WrapperWrite content error", "error", err, "sid", inst.sid)
-								responseError(inst, err)
-								return
-							}
-						}
-						responseData = append(responseData, content)
-						wLogger.Debugf("WrapperWrite stream response think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, chunk_content, inst.sid)
-						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-							wLogger.Errorw("WrapperWrite content callback error", "error", err, "sid", inst.sid)
-							return
-						}
-						index += 1
-					} else if len(response.Choices) > 0 && len(response.Choices[0].Delta.ToolCalls) > 0 {
-						tool_calls := response.Choices[0].Delta.ToolCalls
-						wLogger.Debugf("WrapperWrite stream response tool calls think:%v, index:%v, status:%v, content:%v, sid:%v\n", thinking, index, status, toString(tool_calls), inst.sid)
-						content, err := responseContent(status, index, "", "", nil, tool_calls)
+						wrapperData, err := responseContent(status, index, content, reasoning_content, nil, tool_calls, finish_reason)
 						if err != nil {
-							wLogger.Errorw("WrapperWrite tool_calls error", "error", err, "sid", inst.sid)
+							wLogger.Errorw("WrapperWrite finish reason error", "error", err, "sid", inst.sid)
 							return
 						}
-						responseData = append(responseData, content)
+						responseData = append(responseData, wrapperData)
 						if err = inst.callback(inst.usrTag, responseData, nil); err != nil {
-							wLogger.Errorw("WrapperWrite content callback error", "error", err, "sid", inst.sid)
+							wLogger.Errorw("WrapperWrite finish reason callback error", "error", err, "sid", inst.sid)
 							return
 						}
 						index += 1
@@ -1238,7 +1233,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						promptTokensLen = response.Usage.PromptTokens
 						resultTokensLen = response.Usage.CompletionTokens
 						wLogger.Debugf("WrapperWrite stream responseEnd index:%v, promptTokensLen:%v, resultTokensLen:%v sid:%v\n", index, promptTokensLen, resultTokensLen, inst.sid)
-						err = responseEnd(inst, index, promptTokensLen, resultTokensLen)
+						err = responseEnd(inst, index, response.Usage, finish_reason)
 						if err != nil {
 							return
 						}
