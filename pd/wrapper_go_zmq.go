@@ -61,6 +61,7 @@ var (
 	enableAppIdHeader             bool = true // 是否启用 appID 请求级别metadata
 	serviceName                   string
 	customerHeader                string = "x-custom-labels"
+	v32WebSearchMode              bool   = false // 工具调用是否添加assitant搜索内容，v32格式严格要求
 
 	// extra body
 	continueFinalMessage bool           = false // 是否继续最终消息
@@ -638,6 +639,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Enable App Id Header is disabled")
 	} else {
 		wLogger.Infow("Enable App Id Header is enabled")
+	}
+
+	v32WebSearchModeStr := os.Getenv("V32_WEBSEARCH_MODE")
+	if v32WebSearchModeStr == "true" {
+		v32WebSearchMode = true
 	}
 
 	// 获取端口配置
@@ -1811,6 +1817,56 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 		}
 	}
 
+	// 如果启用 v32WebSearchMode，在 tool 消息前添加 assistant 消息（v32格式严格要求）
+	if v32WebSearchMode && lastToolMsg != nil {
+		// 查找最后一个 tool 消息的位置，如果前面有连续的 tool 消息，找到第一个
+		addIndex := -1
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "tool" {
+				// 向前查找连续的 tool 消息，找到第一个
+				for i > 0 && messages[i-1].Role == "tool" {
+					i--
+				}
+				addIndex = i
+				// 检查前一条消息是否是 assistant
+				if addIndex > 0 && messages[addIndex-1].Role != "assistant" {
+					// 获取 tool 消息的 content 作为参数
+					toolContent := ""
+					if messages[addIndex].Content != nil {
+						if toolContentStr, ok := messages[addIndex].Content.(string); ok {
+							toolContent = toolContentStr
+						}
+					}
+					// 构建 ToolCalls
+					args := map[string]string{
+						"content": toolContent,
+					}
+					argsJSON, err := json.Marshal(args)
+					if err != nil {
+						wLogger.Errorw("Failed to marshal tool call arguments", "error", err)
+					} else {
+						// 插入 assistant 消息并直接设置 ToolCalls
+						assistantMsg := Message{
+							Role: "assistant",
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "tool_calls",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: string(argsJSON),
+									},
+								},
+							},
+						}
+						messages = append(messages[:addIndex], append([]Message{assistantMsg}, messages[addIndex:]...)...)
+					}
+				}
+				break
+			}
+		}
+	}
+
 	return MessageParseResult{
 		Messages:  messages,
 		Functions: parseResult.Functions,
@@ -2123,10 +2179,11 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role         string      `json:"role"`
-	Content      interface{} `json:"content"`
-	ShowRefLabel *bool       `json:"show_ref_label,omitempty"`
-	Prefix       *bool       `json:"prefix,omitempty"` // for continue final message
+	Role         string            `json:"role"`
+	Content      interface{}       `json:"content"`
+	ShowRefLabel *bool             `json:"show_ref_label,omitempty"`
+	Prefix       *bool             `json:"prefix,omitempty"`     // for continue final message
+	ToolCalls    []openai.ToolCall `json:"tool_calls,omitempty"` // for assistant messages with tool calls
 }
 
 // Tool 工具结构
@@ -2276,8 +2333,9 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 			}
 		}
 		openAIMessages[i] = openai.ChatCompletionMessage{
-			Role:    msg.Role,
-			Content: content,
+			Role:      msg.Role,
+			Content:   content,
+			ToolCalls: msg.ToolCalls,
 		}
 	}
 	return openAIMessages
