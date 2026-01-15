@@ -43,6 +43,7 @@ var (
 	sessionManager                *SessionManager
 	requestManager                *RequestManager
 	httpServerPort                int
+	bootstrapPort                 = 8998
 	metricsAutoReport             bool               // 添加全局变量存储是否自动上报指标
 	isDecodeMode                  bool               // 添加全局变量存储PD模式
 	promptSearchTemplate          string             // 添加全局变量存储搜索模板
@@ -486,6 +487,29 @@ func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
 	}
 }
 
+func getFreePort() (int, error) {
+	// 监听一个系统分配端口（0 表示让系统自动选择）
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+
+	// 获取监听的实际地址
+	addr := listener.Addr().(*net.TCPAddr)
+	return addr.Port, nil
+}
+
+func writePortToFile(port int) error {
+	file, err := os.Create("/home/aiges/sglangport")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = fmt.Fprintf(file, "%d", httpServerPort)
+	return err
+}
+
 // Start 启动ZMQ接收器
 func (sm *SessionManager) StartGoReceiver() error {
 	socket, err := sm.zmqContext.NewSocket(zmq.PULL)
@@ -650,6 +674,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 	port := os.Getenv("HTTP_SERVER_PORT")
 	if port == "" {
 		port = "40000"
+	} else if port == "0" {
+		tmpPort, err := getFreePort()
+		if err != nil {
+			return fmt.Errorf("failed to get free port: %v", err)
+		}
+		port = strconv.Itoa(tmpPort)
+		wLogger.Infow("Using free port", "port", port)
 	}
 
 	// 获取端口配置
@@ -693,6 +724,11 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	httpServerPort, _ = strconv.Atoi(port)
 
+	err = writePortToFile(httpServerPort)
+	if err != nil {
+		return fmt.Errorf("cant write port to file:%v", err)
+	}
+
 	// 获取额外参数
 	extraArgs := os.Getenv("CMD_EXTRA_ARGS")
 	if extraArgs == "" {
@@ -720,6 +756,18 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if pdType == "prefill" {
 		isDecodeMode = false
 		extraArgs += " --disaggregation-mode prefill"
+		PD_BOOTSTRAP_PORT := os.Getenv("PD_BOOTSTRAP_PORT")
+		if PD_BOOTSTRAP_PORT == "0" {
+			bootstrapPort, err = getFreePort()
+			if err != nil {
+				return fmt.Errorf("failed to get free port: %v", err)
+			}
+		} else if PD_BOOTSTRAP_PORT != "" {
+			bootstrapPort, _ = strconv.Atoi(PD_BOOTSTRAP_PORT)
+		}
+		if bootstrapPort > 0 {
+			extraArgs += fmt.Sprintf(" --disaggregation-bootstrap-port %d ", bootstrapPort)
+		}
 		wLogger.Infow("Running in prefill mode")
 	} else if pdType == "decode" {
 		extraArgs += " --disaggregation-mode decode"
@@ -751,6 +799,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
 		}
 	}
+
+	// yaml 开启特权模式，能识别到所有的GPU，非整机的服务会部署到相同的GPU节点
+	os.Setenv("CUDA_VISIBLE_DEVICES", os.Getenv("NVIDIA_VISIBLE_DEVICES"))
 
 	// 构建完整的启动命令
 	args := []string{
@@ -873,13 +924,6 @@ type PDInfo struct {
 // getPDInfo 获取PD相关信息
 func getPDInfo() *PDInfo {
 	bootstrapIP := getLocalIP()
-	bootstrapPort := 8998 // 默认端口
-	if port := os.Getenv("PD_BOOTSTRAP_PORT"); port != "" {
-		if p, err := strconv.Atoi(port); err == nil {
-			bootstrapPort = p
-		}
-	}
-
 	roomID := requestManager.IDAllocator.Allocate()
 	prefillAddr := fmt.Sprintf("%s:%d", bootstrapIP, httpServerPort)
 
