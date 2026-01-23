@@ -112,6 +112,7 @@ type SingleStrOut struct {
 	PromptTokens     int                    `msgpack:"prompt_tokens"`
 	CompletionTokens int                    `msgpack:"completion_tokens"`
 	CachedTokens     int                    `msgpack:"cached_tokens"`
+	ReasoningTokens  int                    `msgpack:"reasoning_tokens"`
 	SpecVerifyCt     int                    `msgpack:"spec_verify_ct"`
 }
 
@@ -178,6 +179,7 @@ type BatchStrOut struct {
 	PromptTokens     []int                    `msgpack:"prompt_tokens"`
 	CompletionTokens []int                    `msgpack:"completion_tokens"`
 	CachedTokens     []int                    `msgpack:"cached_tokens"`
+	ReasoningTokens  []int                    `msgpack:"reasoning_tokens"`
 	SpecVerifyCt     []int                    `msgpack:"spec_verify_ct"`
 }
 
@@ -366,6 +368,9 @@ func (sm *SessionManager) HandleBatchOutput(data []byte) error {
 			}
 			if idx < len(batchOut.CachedTokens) {
 				singleOut.CachedTokens = batchOut.CachedTokens[idx]
+			}
+			if idx < len(batchOut.ReasoningTokens) {
+				singleOut.ReasoningTokens = batchOut.ReasoningTokens[idx]
 			}
 			if idx < len(batchOut.SpecVerifyCt) {
 				singleOut.SpecVerifyCt = batchOut.SpecVerifyCt[idx]
@@ -980,10 +985,10 @@ func (inst *wrapperInst) preprocessJsonModeBrace(originalStr string, hasFoundJso
 func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 	// 添加 token 计数变量
 	var chunkIndex int = 0
-	var finished bool = false
 	var ttft time.Duration
 	var hasFoundJsonTokenStart bool = false
 	var status comwrapper.DataStatus = comwrapper.DataBegin
+	var cachedContentData *comwrapper.WrapperData // 暂存带有 finishReason 的 contentData
 
 	defer inst.abortRequest(inst.sid)
 	for {
@@ -1018,11 +1023,16 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 			} else {
 				var chunkContent string
 				var chunkResponse map[string]interface{}
+				var finishReason interface{}
 
 				// 创建响应数据切片
 				responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
 				if len(response.Choices) > 0 {
 					chunkContent = response.Choices[0].Delta.Content
+					fr := response.Choices[0].FinishReason
+					if fr != "" && fr != "null" {
+						finishReason = string(fr)
+					}
 					wLogger.Infow("Decode Get Chunk", "sid", inst.sid, "outStr", chunkContent)
 				}
 				if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
@@ -1061,47 +1071,36 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					inst.thinkingMode = false
 					chunkContent = ""
 				}
+				choice := map[string]interface{}{
+					"index": 0,
+					"role":  "assistant",
+				}
+				hasFinishReason := finishReason != nil
+				if hasFinishReason {
+					choice["finish_reason"] = finishReason
+				}
+
 				if inst.thinkingMode && !inst.jsonMode {
-					// 构建增量响应结构
-					chunkResponse = map[string]interface{}{
-						"choices": []map[string]interface{}{
-							{
-								"content":           "",
-								"reasoning_content": chunkContent,
-								"index":             0,
-								"role":              "assistant",
-							},
-						},
-						"question_type": "",
-					}
+					choice["content"] = ""
+					choice["reasoning_content"] = chunkContent
 				} else if !inst.functionCallMode {
-					chunkResponse = map[string]interface{}{
-						"choices": []map[string]interface{}{
-							{
-								"content":           chunkContent,
-								"reasoning_content": "",
-								"index":             0,
-								"role":              "assistant",
-							},
-						},
-						"question_type": "",
-					}
+					choice["content"] = chunkContent
+					choice["reasoning_content"] = ""
 				} else {
 					// 这里需要 tool call parser 流式解析结果
 					// 需要重写python这块的 toolcall parser 流式解析结果
 					// todo
-					chunkResponse = map[string]interface{}{
-						"choices": []map[string]interface{}{
-							{
-								"content":           nil,
-								"reasoning_content": "",
-								"index":             0,
-								"role":              "assistant",
-								"function_call":     chunkContent,
-							},
-						},
-						"question_type": "",
-					}
+					choice["content"] = nil
+					choice["reasoning_content"] = ""
+					choice["function_call"] = chunkContent
+				}
+
+				// 构建增量响应结构
+				chunkResponse = map[string]interface{}{
+					"choices": []map[string]interface{}{
+						choice,
+					},
+					"question_type": "",
 				}
 				if chunkIndex > 0 {
 					status = comwrapper.DataContinue
@@ -1114,6 +1113,7 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					wLogger.Errorw("Failed to marshal chunk response", "error", err, "sid", inst.sid)
 					continue
 				}
+
 				// 创建响应数据
 				contentData := comwrapper.WrapperData{
 					Key:      "content",
@@ -1123,18 +1123,26 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					Type:     comwrapper.DataText,
 					Status:   status,
 				}
-				if response.Usage != nil {
-					finished = true
+
+				// 如果出现了 finishReason，暂存 contentData，等待 usage 一起发送
+				if hasFinishReason {
 					contentData.Status = comwrapper.DataEnd
+					cachedContentData = &contentData
+					wLogger.Debugw("Cached contentData with finishReason, waiting for usage", "sid", inst.sid)
+				}
+
+				// 如果出现了 usage，将暂存的 contentData 和 usage 一起发送
+				if response.Usage != nil {
 					status = comwrapper.DataEnd
+
 					// 创建usage数据结构
 					usageData := struct {
 						PromptTokens            int                             `json:"prompt_tokens"`
 						CompletionTokens        int                             `json:"completion_tokens"`
 						TotalTokens             int                             `json:"total_tokens"`
 						QuestionTokens          int                             `json:"question_tokens"`
-						PromptTokensDetails     *openai.PromptTokensDetails     `json:"prompt_tokens_details"`
-						CompletionTokensDetails *openai.CompletionTokensDetails `json:"completion_tokens_details"`
+						PromptTokensDetails     *openai.PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+						CompletionTokensDetails *openai.CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 					}{
 						PromptTokens:            response.Usage.PromptTokens,
 						CompletionTokens:        response.Usage.CompletionTokens,
@@ -1161,15 +1169,23 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 						Type:     comwrapper.DataText,
 						Status:   status,
 					}
+
+					// 如果有暂存的 contentData，先发送它，然后发送 usage
+					if cachedContentData != nil {
+						responseData = append(responseData, *cachedContentData)
+						cachedContentData = nil // 清空暂存
+					}
 					responseData = append(responseData, usageWrapperData)
+				} else if !hasFinishReason {
+					// 如果没有 finishReason，正常发送 contentData
+					responseData = append(responseData, contentData)
 				}
-				if finished {
-					contentData.Status = comwrapper.DataEnd
-				}
-				responseData = append(responseData, contentData)
+
 				// 发送响应数据
-				if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
-					wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+				if len(responseData) > 0 {
+					if err := inst.callback(inst.usrTag, responseData, nil); err != nil {
+						wLogger.Errorw("WrapperWrite callback error", "error", err, "sid", inst.sid)
+					}
 				}
 			}
 		}
@@ -1181,6 +1197,7 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 func (inst *wrapperInst) handleGoRecvTokenizer() {
 	// 添加 token 计数变量
 	var totalPromptTokens, totalCompletionTokens int
+	var totalCachedTokens, totalReasoningTokens int
 	var chunkIndex int = 0
 	var finished bool = false
 	var ttft time.Duration
@@ -1213,10 +1230,21 @@ func (inst *wrapperInst) handleGoRecvTokenizer() {
 
 			}
 			var chunkResponse map[string]interface{}
+			var finishReason interface{}
 
 			// 累加 token 数量
 			totalPromptTokens = singleOut.PromptTokens
 			totalCompletionTokens = singleOut.CompletionTokens
+			totalCachedTokens = singleOut.CachedTokens
+			totalReasoningTokens = singleOut.ReasoningTokens
+
+			if singleOut.FinishedReason != nil {
+				if t, ok := singleOut.FinishedReason["type"].(string); ok {
+					finishReason = t
+				} else {
+					finishReason = "stop"
+				}
+			}
 
 			if singleOut.OutputStr == "</think>" {
 				inst.thinkingMode = false
@@ -1226,47 +1254,35 @@ func (inst *wrapperInst) handleGoRecvTokenizer() {
 				inst.thinkingMode = true
 				singleOut.OutputStr = ""
 			}
+			choice := map[string]interface{}{
+				"index": 0,
+				"role":  "assistant",
+			}
+			if finishReason != nil {
+				choice["finish_reason"] = finishReason
+			}
+
 			if inst.thinkingMode && !inst.jsonMode {
-				// 构建增量响应结构
-				chunkResponse = map[string]interface{}{
-					"choices": []map[string]interface{}{
-						{
-							"content":           "",
-							"reasoning_content": singleOut.OutputStr,
-							"index":             0,
-							"role":              "assistant",
-						},
-					},
-					"question_type": "",
-				}
+				choice["content"] = ""
+				choice["reasoning_content"] = singleOut.OutputStr
 			} else if !inst.functionCallMode {
-				chunkResponse = map[string]interface{}{
-					"choices": []map[string]interface{}{
-						{
-							"content":           singleOut.OutputStr,
-							"reasoning_content": "",
-							"index":             0,
-							"role":              "assistant",
-						},
-					},
-					"question_type": "",
-				}
+				choice["content"] = singleOut.OutputStr
+				choice["reasoning_content"] = ""
 			} else {
 				// 这里需要 tool call parser 流式解析结果
 				// 需要重写python这块的 toolcall parser 流式解析结果
 				// todo
-				chunkResponse = map[string]interface{}{
-					"choices": []map[string]interface{}{
-						{
-							"content":           nil,
-							"reasoning_content": "",
-							"index":             0,
-							"role":              "assistant",
-							"function_call":     singleOut.OutputStr,
-						},
-					},
-					"question_type": "",
-				}
+				choice["content"] = nil
+				choice["reasoning_content"] = ""
+				choice["function_call"] = singleOut.OutputStr
+			}
+
+			// 构建增量响应结构
+			chunkResponse = map[string]interface{}{
+				"choices": []map[string]interface{}{
+					choice,
+				},
+				"question_type": "",
 			}
 			chunkIndex++
 
@@ -1295,15 +1311,23 @@ func (inst *wrapperInst) handleGoRecvTokenizer() {
 
 				// 添加累计的 usage 信息
 				usageData := struct {
-					PromptTokens     int `json:"prompt_tokens"`
-					CompletionTokens int `json:"completion_tokens"`
-					TotalTokens      int `json:"total_tokens"`
-					QuestionTokens   int `json:"question_tokens"`
+					PromptTokens            int                             `json:"prompt_tokens"`
+					CompletionTokens        int                             `json:"completion_tokens"`
+					TotalTokens             int                             `json:"total_tokens"`
+					QuestionTokens          int                             `json:"question_tokens"`
+					PromptTokensDetails     *openai.PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+					CompletionTokensDetails *openai.CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 				}{
 					PromptTokens:     totalPromptTokens,
 					CompletionTokens: totalCompletionTokens,
 					TotalTokens:      totalPromptTokens + totalCompletionTokens,
 					QuestionTokens:   0,
+					PromptTokensDetails: &openai.PromptTokensDetails{
+						CachedTokens: totalCachedTokens,
+					},
+					CompletionTokensDetails: &openai.CompletionTokensDetails{
+						ReasoningTokens: totalReasoningTokens,
+					},
 				}
 
 				usageJSON, err := json.Marshal(usageData)

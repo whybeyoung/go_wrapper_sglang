@@ -623,15 +623,19 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						status = comwrapper.DataEnd
 						// 创建usage数据结构
 						usageData := struct {
-							PromptTokens     int `json:"prompt_tokens"`
-							CompletionTokens int `json:"completion_tokens"`
-							TotalTokens      int `json:"total_tokens"`
-							QuestionTokens   int `json:"question_tokens"`
+							PromptTokens            int                             `json:"prompt_tokens"`
+							CompletionTokens        int                             `json:"completion_tokens"`
+							TotalTokens             int                             `json:"total_tokens"`
+							QuestionTokens          int                             `json:"question_tokens"`
+							PromptTokensDetails     *openai.PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+							CompletionTokensDetails *openai.CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 						}{
-							PromptTokens:     response.Usage.PromptTokens,
-							CompletionTokens: response.Usage.CompletionTokens,
-							TotalTokens:      response.Usage.PromptTokens + response.Usage.CompletionTokens,
-							QuestionTokens:   0,
+							PromptTokens:            response.Usage.PromptTokens,
+							CompletionTokens:        response.Usage.CompletionTokens,
+							TotalTokens:             response.Usage.PromptTokens + response.Usage.CompletionTokens,
+							QuestionTokens:          0,
+							PromptTokensDetails:     response.Usage.PromptTokensDetails,
+							CompletionTokensDetails: response.Usage.CompletionTokensDetails,
 						}
 
 						// 序列化usage数据
@@ -655,9 +659,15 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 					}
 					// 处理content数据
-					if len(response.Choices) > 0 && response.Choices[0].Delta.Content != "" {
+					chunkContent := ""
+					finishReason := ""
+					if len(response.Choices) > 0 {
+						chunkContent = response.Choices[0].Delta.Content
+						finishReason = string(response.Choices[0].FinishReason)
+					}
+
+					if chunkContent != "" || (finishReason != "" && finishReason != "null") {
 						index += 1
-						chunkContent := response.Choices[0].Delta.Content
 
 						// log first chunk
 						if index == 1 {
@@ -687,6 +697,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 										"content":           "",
 										"index":             index,
 										"role":              "assistant",
+										"finish_reason":     finishReason,
 									},
 								},
 								"question_type": "",
@@ -699,6 +710,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 										"reasoning_content": "",
 										"index":             index,
 										"role":              "assistant",
+										"finish_reason":     finishReason,
 									},
 								},
 								"question_type": "",
@@ -1112,15 +1124,3 @@ func NewOpenAIClient(baseURL string) *OpenAIClient {
 		openaiClient: openai.NewClientWithConfig(config),
 	}
 }
-
-// ChatCompletionRequest 聊天完成请求
-type ChatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
-	// PD相关参数
-	BootstrapHost string `
