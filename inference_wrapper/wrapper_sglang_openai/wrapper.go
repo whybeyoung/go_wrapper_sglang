@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +67,6 @@ var (
 	maxStopWords           int    = 16    // 添加全局变量存储最大停止词数
 	parallelToolCalls      bool   = false // 添加全局变量存储是否启用并行工具调用
 	addWebsearchContent    bool   = false // 工具调用是否添加assitant搜索内容，v32格式严格要求
-	isMultiContent         bool   = false // vl
 	enableSglangMetrics    bool   = true
 )
 
@@ -222,11 +220,6 @@ func WrapperInit(cfg map[string]string) (err error) {
 	addWebSearchContent := getEnvValue("ADD_WEBSEARCH_CONTENT")
 	if addWebSearchContent == "true" {
 		addWebsearchContent = true
-	}
-
-	isMultiContentStr := getEnvValue("IS_MULTI_CONTENT")
-	if isMultiContentStr == "true" {
-		isMultiContent = true
 	}
 
 	reasoningEffortStr := getEnvValue("REASONING_EFFORT")
@@ -492,6 +485,7 @@ type wrapperInst struct {
 	params               map[string]string
 	active               bool
 	continueFinalMessage bool
+	streamContent        []byte
 }
 
 // WrapperCreate 插件会话实例创建
@@ -1005,7 +999,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		return nil
 	}
 
-	wLogger.Infow("WrapperWrite start", "sid", inst.sid, "usrTag", inst.usrTag)
+	wLogger.Infow("WrapperWrite start", "sid", inst.sid, "usrTag", inst.usrTag, "req", len(req))
 
 	// 检查是否已停止
 	select {
@@ -1020,6 +1014,19 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	for _, v := range req {
 		if v.Key == "__kv_info" {
 			continue // 跳过kv_info数据
+		}
+		// 适配流式请求
+		if v.Status != comwrapper.DataEnd {
+			if len(inst.streamContent) == 0 {
+				inst.streamContent = v.Data
+			} else {
+				inst.streamContent = append(inst.streamContent, v.Data...)
+			}
+			continue
+		} else {
+			if inst.streamContent != nil {
+				v.Data = append(inst.streamContent, v.Data...)
+			}
 		}
 
 		wLogger.Infow("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
@@ -1907,16 +1914,19 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 			ToolCallID: msg.ToolCallID,
 		}
 		content := ""
-		if isMultiContent {
-			multiContent := make([]openai.ChatMessagePart, 0)
-			wLogger.Infow("convertToOpenAIMessages multi content", "content", msg.Content, "contentType", fmt.Sprintf("%T", msg.Content))
+		if msg.Content != nil {
+			switch v := msg.Content.(type) {
+			case string:
+				content = v
+				openAIMessages[i].Content = content
 
-			// 使用反射检查是否为切片类型
-			contentValue := reflect.ValueOf(msg.Content)
-			if contentValue.Kind() == reflect.Slice {
-				// 如果是切片，遍历每个元素并转换为ChatMessagePart
-				for i := 0; i < contentValue.Len(); i++ {
-					item := contentValue.Index(i).Interface()
+			case []interface{}:
+				// 处理 multiContent（使用类型断言，比反射快5-10倍）
+				multiContent := make([]openai.ChatMessagePart, 0)
+				wLogger.Infow("convertToOpenAIMessages multi content", "content", msg.Content, "contentType", fmt.Sprintf("%T", msg.Content))
+
+				// 遍历每个元素并转换为ChatMessagePart
+				for _, item := range v {
 					// 将item序列化为JSON，然后反序列化为ChatMessagePart
 					jsonBytes, marshalErr := json.Marshal(item)
 					if marshalErr != nil {
@@ -1931,21 +1941,14 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 					multiContent = append(multiContent, part)
 				}
 				openAIMessages[i].MultiContent = multiContent
-			} else {
-				wLogger.Errorw("Failed to unmarshal multi content", "error", nil, "content_type", fmt.Sprintf("%T", msg.Content), "content_kind", contentValue.Kind().String())
-				return nil, fmt.Errorf("unsupport multi content type: %T (expected slice)", msg.Content)
-			}
-		} else if msg.Content != nil {
-			switch v := msg.Content.(type) {
-			case string:
-				content = v
+
 			default:
-				// 如果不是字符串，尝试转换为JSON字符串
+				// 如果不是字符串也不是切片，尝试转换为JSON字符串
 				if jsonBytes, err := json.Marshal(v); err == nil {
 					content = string(jsonBytes)
+					openAIMessages[i].Content = content
 				}
 			}
-			openAIMessages[i].Content = content
 		}
 	}
 	return openAIMessages, nil
