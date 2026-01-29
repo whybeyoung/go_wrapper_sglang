@@ -65,7 +65,9 @@ var (
 	serviceName                   string
 	customerHeader                string = "x-custom-labels"
 	v32WebSearchMode              bool   = false // 工具调用是否添加assitant搜索内容，v32格式严格要求
-
+	toolCallParser                string = ""
+	parallelToolCallsStr          string = ""
+	parallelToolCalls             bool   = false
 	// extra body
 	continueFinalMessage bool           = false // 是否继续最终消息
 	logitBias            map[string]int = nil   // 是否继续最终消息
@@ -150,6 +152,12 @@ type schemaMarshaler struct {
 
 func (s schemaMarshaler) MarshalJSON() ([]byte, error) {
 	return s.data, nil
+}
+
+func getEnvValue(key string) string {
+	envStr := os.Getenv(key)
+	wLogger.Infof("getEnvValue %s=%s", key, envStr)
+	return envStr
 }
 
 // 额外参数
@@ -645,10 +653,10 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 从环境变量获取配置
-	baseModel := os.Getenv("FULL_MODEL_PATH")
+	baseModel := getEnvValue("FULL_MODEL_PATH")
 	// 获取json模式系统提示
-	jsonModeSysPromptInject := os.Getenv("JSON_MODE_SYS_PROMPT_INJECT")
-	jsonmodePostProcess := os.Getenv("JSON_MODE_POST_PROCESS")
+	jsonModeSysPromptInject := getEnvValue("JSON_MODE_SYS_PROMPT_INJECT")
+	jsonmodePostProcess := getEnvValue("JSON_MODE_POST_PROCESS")
 
 	if jsonModeSysPromptInject == "false" {
 		enableJsonModeSysPromptInject = false
@@ -664,7 +672,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 获取是否启用 appID 请求级别metadata
-	enableAppIdHeaderStr := os.Getenv("ENABLE_APP_ID_HEADER")
+	enableAppIdHeaderStr := getEnvValue("ENABLE_APP_ID_HEADER")
 	if enableAppIdHeaderStr == "false" {
 		enableAppIdHeader = false
 		wLogger.Infow("Enable App Id Header is disabled")
@@ -672,13 +680,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Enable App Id Header is enabled")
 	}
 
-	v32WebSearchModeStr := os.Getenv("V32_WEBSEARCH_MODE")
+	v32WebSearchModeStr := getEnvValue("V32_WEBSEARCH_MODE")
 	if v32WebSearchModeStr == "true" {
 		v32WebSearchMode = true
 	}
 
 	// 获取端口配置
-	port := os.Getenv("HTTP_SERVER_PORT")
+	port := getEnvValue("HTTP_SERVER_PORT")
 	if port == "" {
 		port = "40000"
 	} else if port == "0" {
@@ -691,15 +699,15 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 获取端口配置
-	zmqPort := os.Getenv("ZMQ_SERVER_PORT")
+	zmqPort := getEnvValue("ZMQ_SERVER_PORT")
 	if zmqPort == "" {
 		zmqPort = "10110"
 	}
 	// 检查SGLang Tokenizer 模式
-	sglangTokenizerMode := os.Getenv("SGLANG_TOKENIZER_MODE")
+	sglangTokenizerMode := getEnvValue("SGLANG_TOKENIZER_MODE")
 	if sglangTokenizerMode == "noraml" {
 		isGoRecvTokenizer = false
-		tokenizerWorkerNumStr := os.Getenv("SGLANG_TOKENIZER_WORKER_NUM")
+		tokenizerWorkerNumStr := getEnvValue("SGLANG_TOKENIZER_WORKER_NUM")
 		if tokenizerWorkerNumStr == "" {
 			tokenizerWorkerNum = 1
 		} else {
@@ -709,9 +717,9 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 检查PD模式
-	pdType := os.Getenv("AIGES_PD_ROLE")
+	pdType := getEnvValue("AIGES_PD_ROLE")
 
-	leaderAddr := os.Getenv("LWS_LEADER_ADDRESS")
+	leaderAddr := getEnvValue("LWS_LEADER_ADDRESS")
 	if leaderAddr != "" {
 		var err error
 		sessionManager, err = NewSessionManager(leaderAddr, zmqPort, pdType)
@@ -737,7 +745,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 
 	// 获取额外参数
-	extraArgs := os.Getenv("CMD_EXTRA_ARGS")
+	extraArgs := getEnvValue("CMD_EXTRA_ARGS")
 	if extraArgs == "" {
 		extraArgs = "--tp 8 --mem-fraction-static 0.93 --torch-compile-max-bs 8 --max-running-requests 20"
 		wLogger.Infow("Using default CMD_ARGS", "args", extraArgs)
@@ -747,7 +755,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	//
 	// 检查是否启用指标
-	enableMetrics := os.Getenv("ENABLE_METRICS")
+	enableMetrics := getEnvValue("ENABLE_METRICS")
 	if enableMetrics == "true" {
 		extraArgs += " --enable-metrics"
 		metricsAutoReport = true
@@ -763,7 +771,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	if pdType == "prefill" {
 		isDecodeMode = false
 		extraArgs += " --disaggregation-mode prefill"
-		PD_BOOTSTRAP_PORT := os.Getenv("PD_BOOTSTRAP_PORT")
+		PD_BOOTSTRAP_PORT := getEnvValue("PD_BOOTSTRAP_PORT")
 		if PD_BOOTSTRAP_PORT == "0" {
 			bootstrapPort, err = getFreePort()
 			if err != nil {
@@ -780,21 +788,30 @@ func WrapperInit(cfg map[string]string) (err error) {
 		extraArgs += " --disaggregation-mode decode"
 		wLogger.Infow("Running in decode mode")
 	}
+	// 检查是否启用tools
+	toolCallParser = getEnvValue("TOOL_CALL_PARSER")
+	if len(toolCallParser) > 0 {
+		extraArgs += fmt.Sprintf(" --tool-call-parser %v ", toolCallParser)
+	}
 
+	parallelToolCallsStr = getEnvValue("PARALLEL_TOOL_CALLS")
+	if parallelToolCallsStr == "true" {
+		parallelToolCalls = true
+	}
 	// 检查多节点模式
-	enableMultiNode := os.Getenv("ENABLE_MULTI_NODE_MODE")
+	enableMultiNode := getEnvValue("ENABLE_MULTI_NODE_MODE")
 	if enableMultiNode == "true" {
 		wLogger.Infow("Multi-node mode enabled")
 
 		// 获取组大小
-		if groupSize := os.Getenv("LWS_GROUP_SIZE"); groupSize != "" {
+		if groupSize := getEnvValue("LWS_GROUP_SIZE"); groupSize != "" {
 			extraArgs += fmt.Sprintf(" --nnodes %s", groupSize)
 		}
 
 		// 获取leader地址
 		if leaderAddr != "" {
 
-			distPort := os.Getenv("DIST_PORT")
+			distPort := getEnvValue("DIST_PORT")
 			if distPort == "" {
 				distPort = "20000"
 			}
@@ -802,13 +819,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 		}
 
 		// 获取worker索引
-		if workerIndex := os.Getenv("LWS_WORKER_INDEX"); workerIndex != "" {
+		if workerIndex := getEnvValue("LWS_WORKER_INDEX"); workerIndex != "" {
 			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
 		}
 	}
 
 	// yaml 开启特权模式，能识别到所有的GPU，非整机的服务会部署到相同的GPU节点
-	os.Setenv("CUDA_VISIBLE_DEVICES", os.Getenv("NVIDIA_VISIBLE_DEVICES"))
+	os.Setenv("CUDA_VISIBLE_DEVICES", getEnvValue("NVIDIA_VISIBLE_DEVICES"))
 
 	// 构建完整的启动命令
 	args := []string{
@@ -863,7 +880,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// sglang指标上报
 	if metricsAutoReport {
 		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort), isDecodeMode)
-		if os.Getenv("K8S_SERVER_URL") != "" {
+		if getEnvValue("K8S_SERVER_URL") != "" {
 			err = UpdatePodMetricsPort(httpServerPort)
 			if err != nil {
 				return fmt.Errorf("failed to update pod metrics port: %v", err)
@@ -1074,18 +1091,42 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 				}
 			} else {
 				var chunkContent string
+				var reasoningContent string
 				var chunkResponse map[string]interface{}
 				var finishReason interface{}
+				var tool_calls []openai.ToolCall
 
 				// 创建响应数据切片
 				responseData := make([]comwrapper.WrapperData, 0, 2) // 预分配容量为2
 				if len(response.Choices) > 0 {
-					chunkContent = response.Choices[0].Delta.Content
+					delta := response.Choices[0].Delta
+
+					// 检查 ReasoningContent（扩展字段，可能不在标准库中）
+					// 通过 JSON marshal/unmarshal 来访问扩展字段
+					if deltaBytes, err := json.Marshal(delta); err == nil {
+						var deltaMap map[string]interface{}
+						if err := json.Unmarshal(deltaBytes, &deltaMap); err == nil {
+							if rc, ok := deltaMap["reasoning_content"].(string); ok && rc != "" {
+								reasoningContent = rc
+							}
+						}
+					}
+
+					// 检查 Content
+					if reasoningContent == "" && delta.Content != "" {
+						chunkContent = delta.Content
+					}
+
+					// 检查 ToolCalls
+					if len(delta.ToolCalls) > 0 {
+						tool_calls = delta.ToolCalls
+					}
+
 					fr := response.Choices[0].FinishReason
 					if fr != "" && fr != "null" {
 						finishReason = string(fr)
 					}
-					wLogger.Infow("Decode Get Chunk", "sid", inst.sid, "outStr", chunkContent)
+					wLogger.Infow("Decode Get Chunk", "sid", inst.sid, "outStr", chunkContent, "reasoningContent", reasoningContent, "tool_calls", tool_calls)
 				}
 				if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
 					ttft = time.Since(inst.firstChunkTime)
@@ -1132,16 +1173,25 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					choice["finish_reason"] = finishReason
 				}
 
-				if inst.thinkingMode && !inst.jsonMode {
+				// 处理 tool_calls
+				if len(tool_calls) > 0 {
+					choice["content"] = nil
+					choice["reasoning_content"] = ""
+					choice["tool_calls"] = tool_calls
+				} else if reasoningContent != "" {
+					// 如果有 reasoningContent，设置 reasoning_content
+					choice["content"] = ""
+					choice["reasoning_content"] = reasoningContent
+				} else if inst.thinkingMode && !inst.jsonMode {
+					// thinking 模式
 					choice["content"] = ""
 					choice["reasoning_content"] = chunkContent
 				} else if !inst.functionCallMode {
+					// 普通内容模式
 					choice["content"] = chunkContent
 					choice["reasoning_content"] = ""
 				} else {
-					// 这里需要 tool call parser 流式解析结果
-					// 需要重写python这块的 toolcall parser 流式解析结果
-					// todo
+					// function call 模式（已废弃，保留兼容性）
 					choice["content"] = nil
 					choice["reasoning_content"] = ""
 					choice["function_call"] = chunkContent
@@ -1670,7 +1720,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		if os.Getenv("IS_REASONING_MODEL") == "true" {
+		if getEnvValue("IS_REASONING_MODEL") == "true" {
 			if len(messages) > 0 {
 				lastMsg := messages[len(messages)-1]
 				if lastMsg.Role != "assistant" {
@@ -1712,6 +1762,44 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				},
 			},
 		}
+
+		// 处理 tools、tool_choice 和 parallel_tool_calls
+		if toolsStr, ok := inst.params["tools"]; ok {
+			tools := make([]openai.Tool, 0)
+			if err := json.Unmarshal([]byte(toolsStr), &tools); err != nil {
+				wLogger.Errorw("WrapperWrite unmarshal tools error", "error", err, "sid", inst.sid, "tools", toolsStr)
+			} else {
+				inst.functionCallMode = true
+				streamReq.Tools = tools
+			}
+			if toolChoiceStr, ok := inst.params["tool_choice"]; ok && toolChoiceStr != "" {
+				wLogger.Infow("WrapperWrite toolChoiceStr", "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+				if strings.HasPrefix(toolChoiceStr, "{") {
+					toolChoice := openai.ToolChoice{}
+					err := json.Unmarshal([]byte(toolChoiceStr), &toolChoice)
+					if err != nil {
+						wLogger.Errorw("WrapperWrite unmarshal toolChoiceStr error", "error", err, "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+					} else {
+						streamReq.ToolChoice = toolChoice
+					}
+				} else {
+					toolChoiceStr = strings.ReplaceAll(toolChoiceStr, "\"", "")
+					streamReq.ToolChoice = toolChoiceStr
+				}
+			} else {
+				streamReq.ToolChoice = "auto"
+			}
+			if parallelToolCallsStr, ok := inst.params["parallel_tool_calls"]; ok {
+				if parallelToolCallsStr == "true" {
+					streamReq.ParallelToolCalls = true
+				} else {
+					streamReq.ParallelToolCalls = false
+				}
+			} else {
+				streamReq.ParallelToolCalls = parallelToolCalls
+			}
+		}
+
 		// use stop
 		if len(stop) > 0 {
 			streamReq.Stop = stop
@@ -1737,21 +1825,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		if len(functions) > 0 {
-			wLogger.Debugw("WrapperWrite functions", "functions", functions)
-			inst.functionCallMode = true
+		// if len(functions) > 0 {
+		// 	wLogger.Debugw("WrapperWrite functions", "functions", functions)
+		// 	inst.functionCallMode = true
 
-			// 将 functions 转换为 openai.Tool
-			tools := make([]openai.Tool, len(functions))
-			for i, function := range functions {
-				tools[i] = openai.Tool{
-					Type:     "function",
-					Function: function,
-				}
-			}
-			streamReq.Tools = tools
-			streamReq.ToolChoice = "auto"
-		}
+		// 	// 将 functions 转换为 openai.Tool
+		// 	tools := make([]openai.Tool, len(functions))
+		// 	for i, function := range functions {
+		// 		tools[i] = openai.Tool{
+		// 			Type:     "function",
+		// 			Function: function,
+		// 		}
+		// 	}
+		// 	streamReq.Tools = tools
+		// 	streamReq.ToolChoice = "auto"
+		// }
 
 		if responseFormat.Type != "" {
 			streamReq.ResponseFormat = &responseFormat
@@ -1809,8 +1897,16 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 
 	// 解析tool消息内容
 	var searchContent []map[string]interface{}
-	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
-		wLogger.Errorw("Failed to parse tool message content", "error", err)
+	toolContentStr := extractTextFromContent(lastToolMsg.Content)
+	if toolContentStr == "" {
+		wLogger.Warnw("Tool message content is empty or invalid", "content", lastToolMsg.Content)
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+	if err := json.Unmarshal([]byte(toolContentStr), &searchContent); err != nil {
+		wLogger.Errorw("Failed to parse tool message content", "error", err, "content", toolContentStr)
 		return MessageParseResult{
 			Messages:  messages,
 			Functions: parseResult.Functions,
@@ -1868,6 +1964,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			}
 
 			// 准备模板数据
+			questionText := extractTextFromContent(messages[i].Content)
 			data := struct {
 				SearchResults string
 				CurDate       string
@@ -1875,7 +1972,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			}{
 				SearchResults: strings.Join(formattedContent, "\n"),
 				CurDate:       currentDate,
-				Question:      messages[i].Content.(string),
+				Question:      questionText,
 			}
 
 			// 执行模板渲染
@@ -1907,12 +2004,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 				// 检查前一条消息是否是 assistant
 				if addIndex > 0 && messages[addIndex-1].Role != "assistant" {
 					// 获取 tool 消息的 content 作为参数
-					toolContent := ""
-					if messages[addIndex].Content != nil {
-						if toolContentStr, ok := messages[addIndex].Content.(string); ok {
-							toolContent = toolContentStr
-						}
-					}
+					toolContent := extractTextFromContent(messages[addIndex].Content)
 					// 构建 ToolCalls
 					args := map[string]string{
 						"content": toolContent,
@@ -2253,10 +2345,38 @@ type ChatCompletionRequest struct {
 	PrefillAddr   string `json:"prefill_addr,omitempty"`
 }
 
+// ImageURLObject 图片URL对象
+type ImageURLObject struct {
+	URL    string `json:"url"`              // 图片URL或base64编码的图片数据
+	Detail string `json:"detail,omitempty"` // 图片细节级别，默认为 "auto"
+}
+
+// InputAudioObject 音频输入对象
+type InputAudioObject struct {
+	Data   string `json:"data"`   // Base64编码的音频数据
+	Format string `json:"format"` // 音频格式，支持 "wav" 和 "mp3"
+}
+
+// FileObject 文件对象
+type FileObject struct {
+	FileData string `json:"file_data,omitempty"` // Base64编码的文件数据
+	FileID   string `json:"file_id,omitempty"`   // 上传文件的ID
+	Filename string `json:"filename,omitempty"`  // 文件名
+}
+
+// ContentPart 内容部分结构，支持多种类型
+type ContentPart struct {
+	Type       string            `json:"type"`                  // text, input_audio, image_url, file
+	Text       string            `json:"text,omitempty"`        // 当 type 为 text 时使用
+	ImageURL   *ImageURLObject   `json:"image_url,omitempty"`   // 当 type 为 image_url 时使用
+	InputAudio *InputAudioObject `json:"input_audio,omitempty"` // 当 type 为 input_audio 时使用
+	File       *FileObject       `json:"file,omitempty"`        // 当 type 为 file 时使用
+}
+
 // Message 消息结构
 type Message struct {
 	Role         string            `json:"role"`
-	Content      interface{}       `json:"content"`
+	Content      interface{}       `json:"content"` // 可以是 string 或 []ContentPart
 	ShowRefLabel *bool             `json:"show_ref_label,omitempty"`
 	Prefix       *bool             `json:"prefix,omitempty"`     // for continue final message
 	ToolCalls    []openai.ToolCall `json:"tool_calls,omitempty"` // for assistant messages with tool calls
@@ -2392,29 +2512,255 @@ func monitorSubprocess(cmd *exec.Cmd) {
 	}
 }
 
+// extractTextFromContent 从 Content 中提取文本内容，支持 string 和数组形式
+func extractTextFromContent(content interface{}) string {
+	if content == nil {
+		return ""
+	}
+
+	switch v := content.(type) {
+	case string:
+		return v
+	case []interface{}:
+		// 数组形式，提取所有 text 类型的文本
+		var texts []string
+		for _, part := range v {
+			// 尝试处理 map[string]interface{} 格式（从 JSON 解析后）
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if partType, ok := partMap["type"].(string); ok && partType == "text" {
+					if text, ok := partMap["text"].(string); ok && text != "" {
+						texts = append(texts, text)
+					}
+				}
+			} else {
+				// 尝试通过 JSON 序列化/反序列化处理
+				if partBytes, err := json.Marshal(part); err == nil {
+					var partObj ContentPart
+					if err := json.Unmarshal(partBytes, &partObj); err == nil {
+						if partObj.Type == "text" && partObj.Text != "" {
+							texts = append(texts, partObj.Text)
+						}
+					}
+				}
+			}
+		}
+		return strings.Join(texts, "\n")
+	case []ContentPart:
+		// ContentPart 数组形式
+		var texts []string
+		for _, part := range v {
+			if part.Type == "text" && part.Text != "" {
+				texts = append(texts, part.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	default:
+		// 其他类型，尝试转换为JSON字符串
+		if jsonBytes, err := json.Marshal(v); err == nil {
+			return string(jsonBytes)
+		}
+		return ""
+	}
+}
+
 // convertToOpenAIMessages 将自定义Message类型转换为OpenAI的ChatCompletionMessage类型
 func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage {
 	openAIMessages := make([]openai.ChatCompletionMessage, len(messages))
 	for i, msg := range messages {
-		content := ""
+		var content string
+		var multiContent []openai.ChatMessagePart
+
 		if msg.Content != nil {
 			switch v := msg.Content.(type) {
 			case string:
+				// 字符串形式，直接使用
 				content = v
+			case []interface{}:
+				// 数组形式，转换为 MultiContent
+				multiContent = convertContentPartsToMultiContent(v)
+			case []ContentPart:
+				// ContentPart 数组形式
+				parts := make([]interface{}, len(v))
+				for j, part := range v {
+					parts[j] = part
+				}
+				multiContent = convertContentPartsToMultiContent(parts)
 			default:
-				// 如果不是字符串，尝试转换为JSON字符串
+				// 其他类型，尝试转换为JSON字符串
 				if jsonBytes, err := json.Marshal(v); err == nil {
 					content = string(jsonBytes)
 				}
 			}
 		}
+
 		openAIMessages[i] = openai.ChatCompletionMessage{
-			Role:      msg.Role,
-			Content:   content,
-			ToolCalls: msg.ToolCalls,
+			Role:         msg.Role,
+			Content:      content,
+			MultiContent: multiContent,
+			ToolCalls:    msg.ToolCalls,
 		}
 	}
 	return openAIMessages
+}
+
+// convertContentPartsToMultiContent 将 ContentPart 数组转换为 OpenAI 的 MultiContent 格式
+func convertContentPartsToMultiContent(parts []interface{}) []openai.ChatMessagePart {
+	multiContent := make([]openai.ChatMessagePart, 0, len(parts))
+
+	for _, part := range parts {
+		var partObj ContentPart
+		// 尝试将 part 转换为 ContentPart
+		// 支持直接是 ContentPart 结构体，或者是从 JSON 解析的 map[string]interface{}
+		if partBytes, err := json.Marshal(part); err == nil {
+			if err := json.Unmarshal(partBytes, &partObj); err == nil {
+				switch partObj.Type {
+				case "text":
+					if partObj.Text != "" {
+						multiContent = append(multiContent, openai.ChatMessagePart{
+							Type: openai.ChatMessagePartTypeText,
+							Text: partObj.Text,
+						})
+					}
+				case "image_url":
+					if partObj.ImageURL != nil && partObj.ImageURL.URL != "" {
+						imageURL := &openai.ChatMessageImageURL{
+							URL: partObj.ImageURL.URL,
+						}
+						if partObj.ImageURL.Detail != "" {
+							imageURL.Detail = openai.ImageURLDetail(partObj.ImageURL.Detail)
+						}
+						multiContent = append(multiContent, openai.ChatMessagePart{
+							Type:     openai.ChatMessagePartTypeImageURL,
+							ImageURL: imageURL,
+						})
+					}
+				case "input_audio":
+					// OpenAI API 不支持 input_audio 类型，转换为 text 格式
+					// 将内容信息编码到文本中
+					if partObj.InputAudio != nil {
+						textContent := fmt.Sprintf("[input_audio: format=%s, data_length=%d]",
+							partObj.InputAudio.Format, len(partObj.InputAudio.Data))
+						multiContent = append(multiContent, openai.ChatMessagePart{
+							Type: openai.ChatMessagePartTypeText,
+							Text: textContent,
+						})
+					}
+				case "file":
+					// OpenAI API 不支持 file 类型，转换为 text 格式
+					if partObj.File != nil {
+						var fileInfo string
+						if partObj.File.FileID != "" {
+							fileInfo = fmt.Sprintf("file_id=%s", partObj.File.FileID)
+						} else if partObj.File.Filename != "" {
+							fileInfo = fmt.Sprintf("filename=%s", partObj.File.Filename)
+						} else if partObj.File.FileData != "" {
+							fileInfo = fmt.Sprintf("data_length=%d", len(partObj.File.FileData))
+						}
+						if fileInfo != "" {
+							multiContent = append(multiContent, openai.ChatMessagePart{
+								Type: openai.ChatMessagePartTypeText,
+								Text: fmt.Sprintf("[file: %s]", fileInfo),
+							})
+						}
+					}
+				default:
+					// 未知类型，尝试提取 text 字段
+					if partObj.Text != "" {
+						multiContent = append(multiContent, openai.ChatMessagePart{
+							Type: openai.ChatMessagePartTypeText,
+							Text: partObj.Text,
+						})
+					}
+				}
+			} else {
+				// 如果解析失败，尝试直接处理 map[string]interface{}
+				if partMap, ok := part.(map[string]interface{}); ok {
+					if partType, ok := partMap["type"].(string); ok {
+						switch partType {
+						case "text":
+							if text, ok := partMap["text"].(string); ok && text != "" {
+								multiContent = append(multiContent, openai.ChatMessagePart{
+									Type: openai.ChatMessagePartTypeText,
+									Text: text,
+								})
+							}
+						case "image_url":
+							// 处理嵌套的 image_url 对象
+							if imageURLMap, ok := partMap["image_url"].(map[string]interface{}); ok {
+								if url, ok := imageURLMap["url"].(string); ok && url != "" {
+									imageURL := &openai.ChatMessageImageURL{
+										URL: url,
+									}
+									if detail, ok := imageURLMap["detail"].(string); ok && detail != "" {
+										imageURL.Detail = openai.ImageURLDetail(detail)
+									}
+									multiContent = append(multiContent, openai.ChatMessagePart{
+										Type:     openai.ChatMessagePartTypeImageURL,
+										ImageURL: imageURL,
+									})
+								}
+							} else if imageURL, ok := partMap["image_url"].(string); ok && imageURL != "" {
+								// 兼容旧格式：直接是字符串
+								multiContent = append(multiContent, openai.ChatMessagePart{
+									Type: openai.ChatMessagePartTypeImageURL,
+									ImageURL: &openai.ChatMessageImageURL{
+										URL: imageURL,
+									},
+								})
+							}
+						case "input_audio":
+							// 处理嵌套的 input_audio 对象
+							if inputAudioMap, ok := partMap["input_audio"].(map[string]interface{}); ok {
+								if format, ok := inputAudioMap["format"].(string); ok {
+									dataLen := 0
+									if data, ok := inputAudioMap["data"].(string); ok {
+										dataLen = len(data)
+									}
+									textContent := fmt.Sprintf("[input_audio: format=%s, data_length=%d]", format, dataLen)
+									multiContent = append(multiContent, openai.ChatMessagePart{
+										Type: openai.ChatMessagePartTypeText,
+										Text: textContent,
+									})
+								}
+							} else if inputAudio, ok := partMap["input_audio"].(string); ok && inputAudio != "" {
+								// 兼容旧格式：直接是字符串
+								multiContent = append(multiContent, openai.ChatMessagePart{
+									Type: openai.ChatMessagePartTypeText,
+									Text: fmt.Sprintf("[input_audio: %s]", inputAudio),
+								})
+							}
+						case "file":
+							// 处理嵌套的 file 对象
+							if fileMap, ok := partMap["file"].(map[string]interface{}); ok {
+								var fileInfo string
+								if fileID, ok := fileMap["file_id"].(string); ok && fileID != "" {
+									fileInfo = fmt.Sprintf("file_id=%s", fileID)
+								} else if filename, ok := fileMap["filename"].(string); ok && filename != "" {
+									fileInfo = fmt.Sprintf("filename=%s", filename)
+								} else if fileData, ok := fileMap["file_data"].(string); ok && fileData != "" {
+									fileInfo = fmt.Sprintf("data_length=%d", len(fileData))
+								}
+								if fileInfo != "" {
+									multiContent = append(multiContent, openai.ChatMessagePart{
+										Type: openai.ChatMessagePartTypeText,
+										Text: fmt.Sprintf("[file: %s]", fileInfo),
+									})
+								}
+							} else if file, ok := partMap["file"].(string); ok && file != "" {
+								// 兼容旧格式：直接是字符串
+								multiContent = append(multiContent, openai.ChatMessagePart{
+									Type: openai.ChatMessagePartTypeText,
+									Text: fmt.Sprintf("[file: %s]", file),
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return multiContent
 }
 
 // GetRequestState 安全地获取请求状态
@@ -2461,9 +2807,9 @@ type metadata struct {
 
 func UpdatePodMetricsPort(port int) error {
 	// 1. 获取环境变量中的Pod信息
-	k8sServeurl := os.Getenv("K8S_SERVER_URL")
-	podName := os.Getenv("POD_NAME")
-	namespace := os.Getenv("POD_NAMESPACE")
+	k8sServeurl := getEnvValue("K8S_SERVER_URL")
+	podName := getEnvValue("POD_NAME")
+	namespace := getEnvValue("POD_NAMESPACE")
 	if podName == "" || namespace == "" || k8sServeurl == "" {
 		fmt.Println("请设置POD_NAME和POD_NAMESPACE环境变量")
 		return fmt.Errorf("请设置POD_NAME和POD_NAMESPACE环境变量")
