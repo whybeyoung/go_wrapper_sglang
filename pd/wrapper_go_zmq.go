@@ -1685,7 +1685,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 创建流式请求
 		formatResult := inst.formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 		messages := convertToOpenAIMessages(formatResult.Messages)
-		functions := formatResult.Functions
+		// functions := formatResult.Functions // 已注释，现在通过 params["tools"] 传递
 
 		if inst.jsonMode && enableJsonModeSysPromptInject {
 			if len(messages) > 0 {
@@ -1771,6 +1771,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			} else {
 				inst.functionCallMode = true
 				streamReq.Tools = tools
+				wLogger.Infow("WrapperWrite tools", "sid", inst.sid, "toolsStr", toolsStr)
 			}
 			if toolChoiceStr, ok := inst.params["tool_choice"]; ok && toolChoiceStr != "" {
 				wLogger.Infow("WrapperWrite toolChoiceStr", "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
