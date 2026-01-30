@@ -1126,7 +1126,16 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					if fr != "" && fr != "null" {
 						finishReason = string(fr)
 					}
-					wLogger.Infow("Decode Get Chunk", "sid", inst.sid, "outStr", chunkContent, "reasoningContent", reasoningContent, "tool_calls", tool_calls)
+					// 构建日志字段，只有当 tool_calls 不为空时才包含
+					logFields := []interface{}{
+						"sid", inst.sid,
+						"outStr", chunkContent,
+						"reasoningContent", reasoningContent,
+					}
+					if len(tool_calls) > 0 {
+						logFields = append(logFields, "tool_calls", tool_calls)
+					}
+					wLogger.Infow("Decode Get Chunk", logFields...)
 				}
 				if chunkIndex == 0 && inst.SessionManager.IsPrefillMode() {
 					ttft = time.Since(inst.firstChunkTime)
@@ -1186,15 +1195,10 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					// thinking 模式
 					choice["content"] = ""
 					choice["reasoning_content"] = chunkContent
-				} else if !inst.functionCallMode {
+				} else {
 					// 普通内容模式
 					choice["content"] = chunkContent
 					choice["reasoning_content"] = ""
-				} else {
-					// function call 模式（已废弃，保留兼容性）
-					choice["content"] = nil
-					choice["reasoning_content"] = ""
-					choice["function_call"] = chunkContent
 				}
 
 				// 构建增量响应结构
