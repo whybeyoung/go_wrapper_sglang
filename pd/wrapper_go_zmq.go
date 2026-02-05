@@ -1691,6 +1691,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		messages := convertToOpenAIMessages(formatResult.Messages)
 		// functions := formatResult.Functions // 已注释，现在通过 params["tools"] 传递
 
+		// 记录转换后的消息中的 tool_calls 用于调试
+		for i, msg := range messages {
+			if len(msg.ToolCalls) > 0 {
+				wLogger.Debugw("WrapperWrite: Found tool_calls in converted message", "index", i, "role", msg.Role, "tool_calls_count", len(msg.ToolCalls), "tool_calls", msg.ToolCalls)
+			}
+		}
+
 		if inst.jsonMode && enableJsonModeSysPromptInject {
 			if len(messages) > 0 {
 				// 从后往前找到最新的一条 role 为 "user" 的消息
@@ -1910,7 +1917,20 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			Functions: parseResult.Functions,
 		}
 	}
+
+	// 先尝试解析为数组格式（搜索结果）
 	if err := json.Unmarshal([]byte(toolContentStr), &searchContent); err != nil {
+		// 如果解析失败，检查是否是错误对象格式
+		var errorObj map[string]interface{}
+		if err2 := json.Unmarshal([]byte(toolContentStr), &errorObj); err2 == nil {
+			// 是对象格式，可能是错误消息，直接返回不处理搜索模板
+			wLogger.Debugw("Tool message content is an error object, skipping search template processing", "error", errorObj)
+			return MessageParseResult{
+				Messages:  messages,
+				Functions: parseResult.Functions,
+			}
+		}
+		// 既不是数组也不是对象，记录错误并返回
 		wLogger.Errorw("Failed to parse tool message content", "error", err, "content", toolContentStr)
 		return MessageParseResult{
 			Messages:  messages,
@@ -2195,9 +2215,13 @@ func parseMessages(prompt string) MessageParseResult {
 	var messages []Message
 	if err := json.Unmarshal([]byte(prompt), &messages); err == nil {
 		// 检查消息格式是否正确
-		for _, msg := range messages {
-			if msg.Role == "" || msg.Content == nil {
-				wLogger.Errorw("Invalid message format", "message", msg)
+		for i, msg := range messages {
+			// 允许 content 为 nil（当有 tool_calls 时）或空数组
+			hasContent := msg.Content != nil
+			hasToolCalls := len(msg.ToolCalls) > 0
+
+			if msg.Role == "" || (!hasContent && !hasToolCalls) {
+				wLogger.Errorw("Invalid message format", "message", msg, "hasContent", hasContent, "hasToolCalls", hasToolCalls)
 				return MessageParseResult{
 					Messages: []Message{{
 						Role:    "user",
@@ -2205,6 +2229,10 @@ func parseMessages(prompt string) MessageParseResult {
 					}},
 					Functions: []*openai.FunctionDefinition{},
 				}
+			}
+			// 记录 tool_calls 信息用于调试
+			if hasToolCalls {
+				wLogger.Debugw("parseMessages: Found tool_calls in message", "index", i, "role", msg.Role, "tool_calls_count", len(msg.ToolCalls), "tool_calls", msg.ToolCalls)
 			}
 		}
 		return MessageParseResult{
@@ -2596,6 +2624,11 @@ func convertToOpenAIMessages(messages []Message) []openai.ChatCompletionMessage 
 					content = string(jsonBytes)
 				}
 			}
+		}
+
+		// 记录 tool_calls 信息用于调试
+		if len(msg.ToolCalls) > 0 {
+			wLogger.Debugw("convertToOpenAIMessages: Found tool_calls", "role", msg.Role, "tool_calls_count", len(msg.ToolCalls), "tool_calls", msg.ToolCalls)
 		}
 
 		openAIMessages[i] = openai.ChatCompletionMessage{
