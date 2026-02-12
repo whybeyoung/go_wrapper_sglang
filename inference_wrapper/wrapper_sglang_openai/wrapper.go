@@ -1656,6 +1656,39 @@ func parseMessages(prompt string) ([]Message, []openai.FunctionDefinition) {
 	}}, nil
 }
 
+// contentToString 安全地将 Content 转换为字符串
+// Content 可能是 string 或 []interface{} (OpenAI 格式)
+func contentToString(content interface{}) string {
+	if content == nil {
+		return ""
+	}
+
+	// 如果是字符串，直接返回
+	if str, ok := content.(string); ok {
+		return str
+	}
+
+	// 如果是数组，尝试提取文本内容
+	if arr, ok := content.([]interface{}); ok {
+		var parts []string
+		for _, item := range arr {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				// OpenAI 格式: {"type": "text", "text": "..."}
+				if text, ok := itemMap["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			} else if str, ok := item.(string); ok {
+				// 如果数组元素是字符串，直接添加
+				parts = append(parts, str)
+			}
+		}
+		return strings.Join(parts, "")
+	}
+
+	// 其他类型，尝试转换为字符串
+	return fmt.Sprintf("%v", content)
+}
+
 // formatMessages 格式化消息，支持搜索模板
 func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
 	messages, functions := parseMessages(prompt)
@@ -1689,8 +1722,9 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	}
 
 	// 解析tool消息内容
+	contentStr := contentToString(lastToolMsg.Content)
 	var searchContent []map[string]interface{}
-	if err := json.Unmarshal([]byte(lastToolMsg.Content.(string)), &searchContent); err != nil {
+	if err := json.Unmarshal([]byte(contentStr), &searchContent); err != nil {
 		wLogger.Errorw("Failed to parse tool message content", "error", err)
 		return messages, functions
 	}
@@ -1773,7 +1807,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			}{
 				SearchResults: strings.Join(formattedContent, "\n"),
 				CurDate:       currentDate,
-				Question:      messages[i].Content.(string),
+				Question:      contentToString(messages[i].Content),
 			}
 
 			// 执行模板渲染
@@ -1784,7 +1818,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			}
 			if addWebsearchContent && addIndex != -1 {
 				args := map[string]string{
-					"content": messages[i].Content.(string),
+					"content": contentToString(messages[i].Content),
 				}
 				argsJSON, err := json.Marshal(args)
 				if err != nil {
@@ -1921,7 +1955,6 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 				openAIMessages[i].Content = content
 
 			case []interface{}:
-				// 处理 multiContent（使用类型断言，比反射快5-10倍）
 				multiContent := make([]openai.ChatMessagePart, 0)
 				wLogger.Infow("convertToOpenAIMessages multi content", "content", msg.Content, "contentType", fmt.Sprintf("%T", msg.Content))
 
