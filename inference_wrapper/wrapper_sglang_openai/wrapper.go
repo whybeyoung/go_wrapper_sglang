@@ -486,6 +486,7 @@ type wrapperInst struct {
 	active               bool
 	continueFinalMessage bool
 	streamContent        []byte
+	Stream               *openai.ChatCompletionStream
 }
 
 // WrapperCreate 插件会话实例创建
@@ -845,6 +846,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			"enable_thinking": enableThinking,
 			"thinking":        enableThinking, // deepseekv31使用
 		},
+		"rid": inst.sid,
 	}
 
 	lora_path := ""
@@ -1073,6 +1075,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			defer cancel()
 
 			stream, err := inst.client.openaiClient.CreateChatCompletionStream(ctx, *req)
+			inst.Stream = stream
 			if err != nil {
 				wLogger.Errorw("WrapperWrite stream error", "error", err, "sid", inst.sid)
 				responseError(inst, err)
@@ -1277,6 +1280,7 @@ func WrapperDestroy(hdl interface{}) (err error) {
 	inst := (*wrapperInst)(hdl.(unsafe.Pointer))
 	wLogger.Infow("WrapperDestroy", "sid", inst.sid)
 	inst.active = false
+	inst.abortRequest(inst.sid)
 	inst.stopQ <- true
 
 	return nil
@@ -1844,6 +1848,13 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	return messages, functions
 }
 
+func (inst *wrapperInst) abortRequest(sid string) {
+	abortRequest(fmt.Sprintf("http://localhost:%d/%s", httpServerPort, "abort_request"), sid)
+	if inst.Stream != nil {
+		inst.Stream.Close()
+	}
+}
+
 // OpenAIClient OpenAI客户端
 type OpenAIClient struct {
 	openaiClient *openai.Client
@@ -2202,4 +2213,14 @@ func readGenerationConfig(baseModelPath string) (map[string]interface{}, error) 
 		fmt.Printf("Top_p from config: %v\n", topP)
 	}
 	return genConfig, nil
+}
+
+func abortRequest(serverUrl, requstid string) {
+	resp, err := http.Post(serverUrl, "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"rid": "%s"}`, requstid))))
+	if err != nil {
+		wLogger.Errorw("Failed to abort request", "error", err, "sid", requstid)
+		return
+	}
+	defer resp.Body.Close()
+
 }
