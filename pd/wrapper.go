@@ -155,9 +155,7 @@ func (s schemaMarshaler) MarshalJSON() ([]byte, error) {
 }
 
 func getEnvValue(key string) string {
-	envStr := os.Getenv(key)
-	wLogger.Infof("getEnvValue %s=%s", key, envStr)
-	return envStr
+	return os.Getenv(key)
 }
 
 // 额外参数
@@ -646,17 +644,32 @@ func WrapperInit(cfg map[string]string) (err error) {
 	}
 	zLogger.Infow("Start Service: ", "serviceName", serviceName)
 
-	if promptSearchTemplate != "" {
-		wLogger.Infow("Using custom prompt search template")
-	} else {
-		wLogger.Infow("No prompt search template provided")
-	}
-
 	// 从环境变量获取配置
 	baseModel := getEnvValue("FULL_MODEL_PATH")
 	// 获取json模式系统提示
 	jsonModeSysPromptInject := getEnvValue("JSON_MODE_SYS_PROMPT_INJECT")
 	jsonmodePostProcess := getEnvValue("JSON_MODE_POST_PROCESS")
+
+	wLogger.Debugw("Env config loaded",
+		"FULL_MODEL_PATH", baseModel,
+		"JSON_MODE_SYS_PROMPT_INJECT", jsonModeSysPromptInject,
+		"JSON_MODE_POST_PROCESS", jsonmodePostProcess,
+		"ENABLE_APP_ID_HEADER", getEnvValue("ENABLE_APP_ID_HEADER"),
+		"V32_WEBSEARCH_MODE", getEnvValue("V32_WEBSEARCH_MODE"),
+		"HTTP_SERVER_PORT", getEnvValue("HTTP_SERVER_PORT"),
+		"ZMQ_SERVER_PORT", getEnvValue("ZMQ_SERVER_PORT"),
+		"SGLANG_TOKENIZER_MODE", getEnvValue("SGLANG_TOKENIZER_MODE"),
+		"AIGES_PD_ROLE", getEnvValue("AIGES_PD_ROLE"),
+		"TOOL_CALL_PARSER", getEnvValue("TOOL_CALL_PARSER"),
+		"ENABLE_METRICS", getEnvValue("ENABLE_METRICS"),
+		"IS_REASONING_MODEL", getEnvValue("IS_REASONING_MODEL"),
+	)
+
+	if promptSearchTemplate != "" {
+		wLogger.Infow("Using custom prompt search template")
+	} else {
+		wLogger.Infow("No prompt search template provided")
+	}
 
 	if jsonModeSysPromptInject == "false" {
 		enableJsonModeSysPromptInject = false
@@ -1149,7 +1162,6 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 
 					// 特殊处理 JsonMode首字 不合法
 					chunkContent = inst.preprocessJsonModeBrace(chunkContent, &hasFoundJsonTokenStart, enableJsonModePostProcess)
-					chunkIndex++
 				}
 				choice := map[string]interface{}{
 					"index": 0,
@@ -1723,9 +1735,16 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		enableThinking := false
 		if enableThinkingStr, ok := inst.params["enable_thinking"]; ok {
 			enableThinking = strings.ToLower(enableThinkingStr) == "true"
-			if enableThinking {
-				wLogger.Infow("WrapperWrite 开思考", "sid", inst.sid, "enable_thinking", enableThinkingStr)
+		} else if parametersStr, ok := inst.params["parameters"]; ok && parametersStr != "" {
+			var nested map[string]interface{}
+			if err := json.Unmarshal([]byte(parametersStr), &nested); err == nil {
+				if v, ok := nested["enable_thinking"]; ok {
+					enableThinking = strings.ToLower(fmt.Sprintf("%v", v)) == "true"
+				}
 			}
+		}
+		if enableThinking {
+			wLogger.Infow("WrapperWrite 开思考", "sid", inst.sid)
 		}
 
 		streamReq := &openai.ChatCompletionRequest{
