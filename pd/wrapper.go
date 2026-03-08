@@ -1672,6 +1672,18 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"logitBias", inst.logitBias,
 		)
 
+		// 从请求体 v.Data 中解析 parameters 字段（兼容框架嵌套传参方式）
+		var reqBody struct {
+			Parameters map[string]interface{} `json:"parameters"`
+		}
+		if err := json.Unmarshal(v.Data, &reqBody); err == nil && reqBody.Parameters != nil {
+			if v, ok := reqBody.Parameters["enable_thinking"]; ok {
+				if b, ok := v.(bool); ok && b {
+					inst.params["enable_thinking"] = "true"
+				}
+			}
+		}
+
 		// 创建流式请求
 		formatResult := inst.formatMessages(string(v.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 		messages := convertToOpenAIMessages(formatResult.Messages)
@@ -1735,16 +1747,9 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		enableThinking := false
 		if enableThinkingStr, ok := inst.params["enable_thinking"]; ok {
 			enableThinking = strings.ToLower(enableThinkingStr) == "true"
-		} else if parametersStr, ok := inst.params["parameters"]; ok && parametersStr != "" {
-			var nested map[string]interface{}
-			if err := json.Unmarshal([]byte(parametersStr), &nested); err == nil {
-				if v, ok := nested["enable_thinking"]; ok {
-					enableThinking = strings.ToLower(fmt.Sprintf("%v", v)) == "true"
-				}
+			if enableThinking {
+				wLogger.Infow("WrapperWrite 开思考", "sid", inst.sid, "enable_thinking", enableThinkingStr)
 			}
-		}
-		if enableThinking {
-			wLogger.Infow("WrapperWrite 开思考", "sid", inst.sid)
 		}
 
 		streamReq := &openai.ChatCompletionRequest{
