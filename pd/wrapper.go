@@ -1147,31 +1147,9 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					ttft = time.Since(inst.firstChunkTime)
 					wLogger.Infow("Decode Get First Chunk,  send keepalive_down for pd", "sid", inst.sid, "ttft", ttft, "outStr", chunkContent)
 
-					// 处理content数据
 					// 特殊处理 JsonMode首字 不合法
 					chunkContent = inst.preprocessJsonModeBrace(chunkContent, &hasFoundJsonTokenStart, enableJsonModePostProcess)
-					// 处理thinking结束的情况
-					if chunkContent == "<think>" {
-						inst.thinkingMode = true
-						chunkContent = ""
-					}
-
-					if chunkContent == "</think>" {
-						inst.thinkingMode = false
-						chunkContent = ""
-					}
 					chunkIndex++
-
-				} else if (chunkIndex == 1 || chunkIndex == 2) && !inst.SessionManager.IsPrefillMode() {
-					// 处理thinking结束的情况,真尼玛恶心
-					if chunkContent == "<think>" {
-						inst.thinkingMode = true
-						chunkContent = ""
-					}
-				}
-				if strings.Contains(chunkContent, "</think>") {
-					inst.thinkingMode = false
-					chunkContent = ""
 				}
 				choice := map[string]interface{}{
 					"index": 0,
@@ -1188,15 +1166,11 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					choice["reasoning_content"] = ""
 					choice["tool_calls"] = tool_calls
 				} else if reasoningContent != "" {
-					// 如果有 reasoningContent，设置 reasoning_content
+					// sglang 已分离 reasoning_content，直接透传
 					choice["content"] = ""
 					choice["reasoning_content"] = reasoningContent
-				} else if inst.thinkingMode && !inst.jsonMode {
-					// thinking 模式
-					choice["content"] = ""
-					choice["reasoning_content"] = chunkContent
 				} else {
-					// 普通内容模式
+					// 普通内容模式（含 thinking 关闭时的正文）
 					choice["content"] = chunkContent
 					choice["reasoning_content"] = ""
 				}
@@ -1749,6 +1723,9 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		enableThinking := false
 		if enableThinkingStr, ok := inst.params["enable_thinking"]; ok {
 			enableThinking = strings.ToLower(enableThinkingStr) == "true"
+			if enableThinking {
+				wLogger.Infow("WrapperWrite 开思考", "sid", inst.sid, "enable_thinking", enableThinkingStr)
+			}
 		}
 
 		streamReq := &openai.ChatCompletionRequest{
@@ -1854,9 +1831,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 
 		if responseFormat.Type != "" {
 			streamReq.ResponseFormat = &responseFormat
-		}
-		if enableThinking {
-			inst.thinkingMode = true
 		}
 		streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
 			"enable_thinking": enableThinking,
