@@ -1680,6 +1680,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			if v, ok := reqBody.Parameters["enable_thinking"]; ok {
 				if b, ok := v.(bool); ok && b {
 					inst.params["enable_thinking"] = "true"
+					wLogger.Infow("WrapperWrite enable_thinking from parameters", "sid", inst.sid, "enable_thinking", b)
 				}
 			}
 		}
