@@ -428,74 +428,72 @@ func (sm *SessionManager) receiveLoop() {
 	}
 }
 
-func reportSglangMetrics(serverMetricURL string, isDecodeMode bool) {
-	wLogger.Debugw("sglang metric start")
-	httpClient := http.Client{
-		Timeout: time.Second,
-	}
-	var metricName, logstr string
-	if isDecodeMode {
-		metricName = "sglang:gen_throughput"
-		logstr = "decode throughput"
-	} else {
-		metricName = "sglang:prompt_tokens_total"
-		logstr = "prefill throughput"
-	}
-	sleepInterval := 10 * time.Second
-	lastReportTime := time.Now()
-	lastMetricValue := float64(0)
-	newMetricValue := float64(0)
-	throughput := float64(0)
-	has_generation_tokens_total := false
-	generation_token_metric := "sglang:generation_tokens_total"
-	for {
+type GetLoadItem struct {
+	DpRank         *int    `json:"dp_rank"`
+	NumReqs        int     `json:"num_reqs"`
+	NumWaitingReqs int     `json:"num_waiting_reqs"`
+	NumTokens      int     `json:"num_tokens"`
+	TsTic          float64 `json:"ts_tic"`
+}
 
-		resp, err := httpClient.Get(serverMetricURL)
+func reportSglangMetrics(serverGetLoadURL string, isDecodeMode bool) {
+	wLogger.Debugw("sglang load report start", "url", serverGetLoadURL, "isDecodeMode", isDecodeMode)
+	httpClient := http.Client{
+		Timeout: 3 * time.Second,
+	}
+	sleepInterval := 1 * time.Second
+	if v := getEnvValue("LOAD_REPORT_INTERVAL"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			sleepInterval = time.Duration(sec) * time.Second
+		}
+	}
+	wLogger.Debugw("metrics report interval", "interval", sleepInterval)
+
+	for {
+		resp, err := httpClient.Get(serverGetLoadURL)
 		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
+			wLogger.Errorw("get_load request failed", "err", err.Error())
 			time.Sleep(sleepInterval)
 			continue
 		}
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			wLogger.Errorw("sglang metric", "err", err.Error())
+			wLogger.Errorw("get_load read body failed", "err", err.Error())
 			time.Sleep(sleepInterval)
 			continue
 		}
-		//wLogger.Debugw("sglang metric", "resp", string(body))
-		sglangMetrics := ParseMetrics(string(body))
-		if has_generation_tokens_total {
-			metricName = generation_token_metric
-		}
-		if sglangMetrics != nil {
-			if metric, ok := sglangMetrics[metricName]; ok && len(metric.Content) > 0 {
-				lastMetricValue = newMetricValue
-				newMetricValue = metric.Content[0].Value
-				delta := newMetricValue - lastMetricValue
-				deltaTime := time.Since(lastReportTime)
-				lastReportTime = time.Now()
-				if isDecodeMode && !has_generation_tokens_total {
-					throughput = newMetricValue
-				} else {
-					throughput = float64(delta) / deltaTime.Seconds()
-				}
 
-				res := map[string]string{}
-				wrapperInfo := map[string]any{}
-				wrapperInfo["throughput"] = throughput
-				wrapperInfo["throughput_max"] = throughputMax
-				wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
-				res["wrapper_info"] = string(wrapperInfoBytes)
-				wLogger.Debugw(logstr, "throughput", wrapperInfo["throughput"], "throughput_max", wrapperInfo["throughput_max"])
-				err = LbExtraFunc(res)
-				if err != nil {
-					wLogger.Errorw("sglang metric", "err", err.Error())
-				}
-			} else if _, ok = sglangMetrics[generation_token_metric]; ok && isDecodeMode {
-				has_generation_tokens_total = true
+		var loadItems []GetLoadItem
+		if err := json.Unmarshal(body, &loadItems); err != nil {
+			wLogger.Errorw("get_load parse json failed", "err", err.Error(), "body", string(body))
+			time.Sleep(sleepInterval)
+			continue
+		}
+
+		totalTokens := 0
+		for _, item := range loadItems {
+			totalTokens += item.NumTokens
+		}
+		throughput := float64(totalTokens)
+
+		wrapperInfo := map[string]any{
+			"throughput":     throughput,
+			"throughput_max": throughputMax,
+		}
+		wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
+		res := map[string]string{
+			"wrapper_info": string(wrapperInfoBytes),
+		}
+
+		wLogger.Debugw("load report", "throughput", throughput, "throughput_max", throughputMax)
+
+		if LbExtraFunc != nil {
+			if err := LbExtraFunc(res); err != nil {
+				wLogger.Errorw("lb extra func report failed", "err", err.Error())
 			}
 		}
+
 		time.Sleep(sleepInterval)
 	}
 }
@@ -892,7 +890,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 启动 metrics 上报
 	// sglang指标上报
 	if metricsAutoReport {
-		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/metrics", httpServerPort), isDecodeMode)
+		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/get_load", httpServerPort), isDecodeMode)
 		if getEnvValue("K8S_SERVER_URL") != "" {
 			err = UpdatePodMetricsPort(httpServerPort)
 			if err != nil {
