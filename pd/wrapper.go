@@ -428,6 +428,7 @@ func (sm *SessionManager) receiveLoop() {
 	}
 }
 
+// /get_load response item
 type GetLoadItem struct {
 	DpRank         *int    `json:"dp_rank"`
 	NumReqs        int     `json:"num_reqs"`
@@ -436,8 +437,49 @@ type GetLoadItem struct {
 	TsTic          float64 `json:"ts_tic"`
 }
 
-func reportSglangMetrics(serverGetLoadURL string, isDecodeMode bool) {
-	wLogger.Debugw("sglang load report start", "url", serverGetLoadURL, "isDecodeMode", isDecodeMode)
+// /v1/loads response
+type V1LoadResponse struct {
+	Loads     []V1LoadItem `json:"loads"`
+	Aggregate V1Aggregate  `json:"aggregate"`
+}
+
+type V1LoadItem struct {
+	DpRank            *int    `json:"dp_rank"`
+	NumRunningReqs    int     `json:"num_running_reqs"`
+	NumWaitingReqs    int     `json:"num_waiting_reqs"`
+	NumUsedTokens     int     `json:"num_used_tokens"`
+	MaxTotalNumTokens int     `json:"max_total_num_tokens"`
+	TokenUsage        float64 `json:"token_usage"`
+	GenThroughput     float64 `json:"gen_throughput"`
+	Utilization       float64 `json:"utilization"`
+}
+
+type V1Aggregate struct {
+	TotalRunningReqs      int     `json:"total_running_reqs"`
+	TotalWaitingReqs      int     `json:"total_waiting_reqs"`
+	TotalReqs             int     `json:"total_reqs"`
+	AvgTokenUsage         float64 `json:"avg_token_usage"`
+	AvgThroughput         float64 `json:"avg_throughput"`
+	AvgUtilization        float64 `json:"avg_utilization"`
+	PromptTokensTotal     float64 `json:"prompt_tokens_total"`
+	CompletionTokensTotal float64 `json:"completion_tokens_total"`
+	TotalTokensTotal      float64 `json:"total_tokens_total"`
+}
+
+func reportSglangMetrics(baseURL string, isDecodeMode bool) {
+	v1Load := true
+	if v := getEnvValue("V1_LOAD_API"); v == "false" {
+		v1Load = false
+	}
+
+	var loadURL string
+	if v1Load {
+		loadURL = baseURL + "/v1/loads"
+	} else {
+		loadURL = baseURL + "/metrics"
+	}
+
+	wLogger.Debugw("sglang load report start", "url", loadURL, "v1Load", v1Load, "isDecodeMode", isDecodeMode)
 	httpClient := http.Client{
 		Timeout: 3 * time.Second,
 	}
@@ -447,46 +489,51 @@ func reportSglangMetrics(serverGetLoadURL string, isDecodeMode bool) {
 			sleepInterval = time.Duration(sec) * time.Second
 		}
 	}
-	wLogger.Debugw("metrics report interval", "interval", sleepInterval)
+	wLogger.Debugw("load report interval", "interval", sleepInterval)
+
+	lastReportTime := time.Now()
+	lastCounterValue := float64(-1) // -1 indicates first sample, skip throughput calculation
+	hasGenerationTokensTotal := false
 
 	for {
-		resp, err := httpClient.Get(serverGetLoadURL)
+		resp, err := httpClient.Get(loadURL)
 		if err != nil {
-			wLogger.Errorw("get_load request failed", "err", err.Error())
+			wLogger.Errorw("load request failed", "err", err.Error(), "url", loadURL)
 			time.Sleep(sleepInterval)
 			continue
 		}
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			wLogger.Errorw("get_load read body failed", "err", err.Error())
+			wLogger.Errorw("load read body failed", "err", err.Error())
 			time.Sleep(sleepInterval)
 			continue
 		}
 
-		var loadItems []GetLoadItem
-		if err := json.Unmarshal(body, &loadItems); err != nil {
-			wLogger.Errorw("get_load parse json failed", "err", err.Error(), "body", string(body))
-			time.Sleep(sleepInterval)
-			continue
+		var throughput float64
+		var reportThroughputMax float64
+
+		if v1Load {
+			throughput, reportThroughputMax = reportV1Loads(body, isDecodeMode, &lastReportTime, &lastCounterValue)
+		} else {
+			throughput = reportMetrics(body, isDecodeMode, &lastReportTime, &lastCounterValue, &hasGenerationTokensTotal)
+			reportThroughputMax = throughputMax
 		}
 
-		totalTokens := 0
-		for _, item := range loadItems {
-			totalTokens += item.NumTokens
+		if reportThroughputMax <= 0 {
+			reportThroughputMax = throughputMax
 		}
-		throughput := float64(totalTokens)
 
 		wrapperInfo := map[string]any{
 			"throughput":     throughput,
-			"throughput_max": throughputMax,
+			"throughput_max": reportThroughputMax,
 		}
 		wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
 		res := map[string]string{
 			"wrapper_info": string(wrapperInfoBytes),
 		}
 
-		wLogger.Debugw("load report", "throughput", throughput, "throughput_max", throughputMax)
+		wLogger.Debugw("load report", "throughput", throughput, "throughput_max", reportThroughputMax)
 
 		if LbExtraFunc != nil {
 			if err := LbExtraFunc(res); err != nil {
@@ -496,6 +543,90 @@ func reportSglangMetrics(serverGetLoadURL string, isDecodeMode bool) {
 
 		time.Sleep(sleepInterval)
 	}
+}
+
+func reportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastCounterValue *float64) (throughput float64, maxTokens float64) {
+	var v1Resp V1LoadResponse
+	if err := json.Unmarshal(body, &v1Resp); err != nil {
+		wLogger.Errorw("v1/loads parse json failed", "err", err.Error(), "body", string(body))
+		return 0, 0
+	}
+	totalMaxTokens := 0
+	for _, item := range v1Resp.Loads {
+		totalMaxTokens += item.MaxTotalNumTokens
+	}
+
+	if isDecodeMode {
+		totalGenThroughput := float64(0)
+		for _, item := range v1Resp.Loads {
+			totalGenThroughput += item.GenThroughput
+		}
+		return totalGenThroughput, float64(totalMaxTokens)
+	}
+
+	// prefill: PromptTokensTotal is a cumulative counter, compute rate
+	newValue := v1Resp.Aggregate.PromptTokensTotal
+	if *lastCounterValue < 0 {
+		*lastCounterValue = newValue
+		*lastReportTime = time.Now()
+		return 0, float64(totalMaxTokens)
+	}
+	delta := newValue - *lastCounterValue
+	deltaTime := time.Since(*lastReportTime)
+	*lastCounterValue = newValue
+	*lastReportTime = time.Now()
+
+	if delta > 0 && deltaTime.Seconds() > 0 {
+		throughput = delta / deltaTime.Seconds()
+	}
+	return throughput, float64(totalMaxTokens)
+}
+
+func reportMetrics(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastCounterValue *float64, hasGenerationTokensTotal *bool) float64 {
+	sglangMetrics := ParseMetrics(string(body))
+	if sglangMetrics == nil {
+		return 0
+	}
+
+	metricName := "sglang:prompt_tokens_total"
+	if isDecodeMode {
+		if *hasGenerationTokensTotal {
+			metricName = "sglang:generation_tokens_total"
+		} else {
+			metricName = "sglang:gen_throughput"
+		}
+	}
+
+	metric, ok := sglangMetrics[metricName]
+	if !ok || len(metric.Content) == 0 {
+		if isDecodeMode && !*hasGenerationTokensTotal {
+			if _, exists := sglangMetrics["sglang:generation_tokens_total"]; exists {
+				*hasGenerationTokensTotal = true
+			}
+		}
+		return 0
+	}
+
+	newValue := metric.Content[0].Value
+	if isDecodeMode && !*hasGenerationTokensTotal {
+		return newValue
+	}
+
+	// counter → rate: delta / deltaTime
+	if *lastCounterValue < 0 {
+		*lastCounterValue = newValue
+		*lastReportTime = time.Now()
+		return 0
+	}
+	delta := newValue - *lastCounterValue
+	deltaTime := time.Since(*lastReportTime)
+	*lastCounterValue = newValue
+	*lastReportTime = time.Now()
+
+	if delta > 0 && deltaTime.Seconds() > 0 {
+		return delta / deltaTime.Seconds()
+	}
+	return 0
 }
 
 func getFreePort() (int, error) {
@@ -890,7 +1021,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 启动 metrics 上报
 	// sglang指标上报
 	if metricsAutoReport {
-		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d/get_load", httpServerPort), isDecodeMode)
+		go reportSglangMetrics(fmt.Sprintf("http://localhost:%d", httpServerPort), isDecodeMode)
 		if getEnvValue("K8S_SERVER_URL") != "" {
 			err = UpdatePodMetricsPort(httpServerPort)
 			if err != nil {
