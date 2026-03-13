@@ -491,9 +491,19 @@ func reportSglangMetrics(baseURL string, isDecodeMode bool) {
 	}
 	wLogger.Debugw("load report interval", "interval", sleepInterval)
 
+	var logstr string
+	if isDecodeMode {
+		logstr = "decode throughput"
+	} else {
+		logstr = "prefill throughput"
+	}
+
 	lastReportTime := time.Now()
-	lastCounterValue := float64(-1) // -1 indicates first sample, skip throughput calculation
+	lastMetricValue := float64(0)
+	newMetricValue := float64(0)
+	throughput := float64(0)
 	hasGenerationTokensTotal := false
+	generationTokenMetric := "sglang:generation_tokens_total"
 
 	for {
 		resp, err := httpClient.Get(loadURL)
@@ -510,50 +520,47 @@ func reportSglangMetrics(baseURL string, isDecodeMode bool) {
 			continue
 		}
 
-		var throughput float64
-		var reportThroughputMax float64
-
 		if v1Load {
-			throughput, reportThroughputMax = reportV1Loads(body, isDecodeMode, &lastReportTime, &lastCounterValue)
+			doReportV1Loads(body, isDecodeMode, &lastReportTime, &lastMetricValue, &newMetricValue, &throughput, logstr)
 		} else {
-			throughput = reportMetrics(body, isDecodeMode, &lastReportTime, &lastCounterValue, &hasGenerationTokensTotal)
-			reportThroughputMax = throughputMax
-		}
-
-		if reportThroughputMax <= 0 {
-			reportThroughputMax = throughputMax
-		}
-
-		wrapperInfo := map[string]any{
-			"throughput":     throughput,
-			"throughput_max": reportThroughputMax,
-		}
-		wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
-		res := map[string]string{
-			"wrapper_info": string(wrapperInfoBytes),
-		}
-
-		wLogger.Debugw("load report", "throughput", throughput, "throughput_max", reportThroughputMax)
-
-		if LbExtraFunc != nil {
-			if err := LbExtraFunc(res); err != nil {
-				wLogger.Errorw("lb extra func report failed", "err", err.Error())
-			}
+			doReportMetrics(body, isDecodeMode, &lastReportTime, &lastMetricValue, &newMetricValue, &throughput, &hasGenerationTokensTotal, generationTokenMetric, logstr)
 		}
 
 		time.Sleep(sleepInterval)
 	}
 }
 
-func reportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastCounterValue *float64) (throughput float64, maxTokens float64) {
+func doReport(throughput float64, reportThroughputMax float64, logstr string) {
+	wrapperInfo := map[string]any{
+		"throughput":     throughput,
+		"throughput_max": reportThroughputMax,
+	}
+	wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
+	res := map[string]string{
+		"wrapper_info": string(wrapperInfoBytes),
+	}
+	wLogger.Debugw(logstr, "throughput", throughput, "throughput_max", reportThroughputMax)
+	if LbExtraFunc != nil {
+		if err := LbExtraFunc(res); err != nil {
+			wLogger.Errorw("lb extra func report failed", "err", err.Error())
+		}
+	}
+}
+
+func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
 	var v1Resp V1LoadResponse
 	if err := json.Unmarshal(body, &v1Resp); err != nil {
 		wLogger.Errorw("v1/loads parse json failed", "err", err.Error(), "body", string(body))
-		return 0, 0
+		return
 	}
-	totalMaxTokens := 0
-	for _, item := range v1Resp.Loads {
-		totalMaxTokens += item.MaxTotalNumTokens
+
+	reportThroughputMax := throughputMax
+	if reportThroughputMax <= 0 {
+		totalMaxTokens := 0
+		for _, item := range v1Resp.Loads {
+			totalMaxTokens += item.MaxTotalNumTokens
+		}
+		reportThroughputMax = float64(totalMaxTokens)
 	}
 
 	if isDecodeMode {
@@ -561,37 +568,33 @@ func reportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, la
 		for _, item := range v1Resp.Loads {
 			totalGenThroughput += item.GenThroughput
 		}
-		return totalGenThroughput, float64(totalMaxTokens)
+		*throughput = totalGenThroughput
+		doReport(*throughput, reportThroughputMax, logstr)
+		return
 	}
 
 	// prefill: PromptTokensTotal is a cumulative counter, compute rate
-	newValue := v1Resp.Aggregate.PromptTokensTotal
-	if *lastCounterValue < 0 {
-		*lastCounterValue = newValue
-		*lastReportTime = time.Now()
-		return 0, float64(totalMaxTokens)
-	}
-	delta := newValue - *lastCounterValue
+	*lastMetricValue = *newMetricValue
+	*newMetricValue = v1Resp.Aggregate.PromptTokensTotal
+	delta := *newMetricValue - *lastMetricValue
 	deltaTime := time.Since(*lastReportTime)
-	*lastCounterValue = newValue
 	*lastReportTime = time.Now()
-
-	if delta > 0 && deltaTime.Seconds() > 0 {
-		throughput = delta / deltaTime.Seconds()
+	if deltaTime.Seconds() > 0 {
+		*throughput = delta / deltaTime.Seconds()
 	}
-	return throughput, float64(totalMaxTokens)
+	doReport(*throughput, reportThroughputMax, logstr)
 }
 
-func reportMetrics(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastCounterValue *float64, hasGenerationTokensTotal *bool) float64 {
+func doReportMetrics(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, hasGenerationTokensTotal *bool, generationTokenMetric string, logstr string) {
 	sglangMetrics := ParseMetrics(string(body))
 	if sglangMetrics == nil {
-		return 0
+		return
 	}
 
 	metricName := "sglang:prompt_tokens_total"
 	if isDecodeMode {
 		if *hasGenerationTokensTotal {
-			metricName = "sglang:generation_tokens_total"
+			metricName = generationTokenMetric
 		} else {
 			metricName = "sglang:gen_throughput"
 		}
@@ -600,33 +603,25 @@ func reportMetrics(body []byte, isDecodeMode bool, lastReportTime *time.Time, la
 	metric, ok := sglangMetrics[metricName]
 	if !ok || len(metric.Content) == 0 {
 		if isDecodeMode && !*hasGenerationTokensTotal {
-			if _, exists := sglangMetrics["sglang:generation_tokens_total"]; exists {
+			if _, exists := sglangMetrics[generationTokenMetric]; exists {
 				*hasGenerationTokensTotal = true
 			}
 		}
-		return 0
+		return
 	}
 
-	newValue := metric.Content[0].Value
-	if isDecodeMode && !*hasGenerationTokensTotal {
-		return newValue
-	}
-
-	// counter → rate: delta / deltaTime
-	if *lastCounterValue < 0 {
-		*lastCounterValue = newValue
-		*lastReportTime = time.Now()
-		return 0
-	}
-	delta := newValue - *lastCounterValue
+	*lastMetricValue = *newMetricValue
+	*newMetricValue = metric.Content[0].Value
+	delta := *newMetricValue - *lastMetricValue
 	deltaTime := time.Since(*lastReportTime)
-	*lastCounterValue = newValue
 	*lastReportTime = time.Now()
-
-	if delta > 0 && deltaTime.Seconds() > 0 {
-		return delta / deltaTime.Seconds()
+	if isDecodeMode && !*hasGenerationTokensTotal {
+		*throughput = *newMetricValue
+	} else {
+		*throughput = delta / deltaTime.Seconds()
 	}
-	return 0
+
+	doReport(*throughput, throughputMax, logstr)
 }
 
 func getFreePort() (int, error) {
