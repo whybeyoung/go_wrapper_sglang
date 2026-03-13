@@ -467,9 +467,9 @@ type V1Aggregate struct {
 }
 
 func reportSglangMetrics(baseURL string, isDecodeMode bool) {
-	v1Load := true
-	if v := getEnvValue("V1_LOAD_API"); v == "false" {
-		v1Load = false
+	v1Load := false
+	if v := getEnvValue("V1_LOAD_API"); v == "true" {
+		v1Load = true
 	}
 
 	var loadURL string
@@ -483,7 +483,7 @@ func reportSglangMetrics(baseURL string, isDecodeMode bool) {
 	httpClient := http.Client{
 		Timeout: 3 * time.Second,
 	}
-	sleepInterval := 1 * time.Second
+	sleepInterval := 5 * time.Second
 	if v := getEnvValue("LOAD_REPORT_INTERVAL"); v != "" {
 		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
 			sleepInterval = time.Duration(sec) * time.Second
