@@ -444,14 +444,27 @@ type V1LoadResponse struct {
 }
 
 type V1LoadItem struct {
-	DpRank            *int    `json:"dp_rank"`
-	NumRunningReqs    int     `json:"num_running_reqs"`
-	NumWaitingReqs    int     `json:"num_waiting_reqs"`
-	NumUsedTokens     int     `json:"num_used_tokens"`
-	MaxTotalNumTokens int     `json:"max_total_num_tokens"`
-	TokenUsage        float64 `json:"token_usage"`
-	GenThroughput     float64 `json:"gen_throughput"`
-	Utilization       float64 `json:"utilization"`
+	DpRank            *int                    `json:"dp_rank"`
+	NumRunningReqs    int                     `json:"num_running_reqs"`
+	NumWaitingReqs    int                     `json:"num_waiting_reqs"`
+	NumUsedTokens     int                     `json:"num_used_tokens"`
+	MaxTotalNumTokens int                     `json:"max_total_num_tokens"`
+	TokenUsage        float64                 `json:"token_usage"`
+	GenThroughput     float64                 `json:"gen_throughput"`
+	InputThroughput   float64                 `json:"input_throughput"`
+	CacheHitRate      float64                 `json:"cache_hit_rate"`
+	Utilization       float64                 `json:"utilization"`
+	Disaggregation    *V1DisaggregationMetrics `json:"disaggregation,omitempty"`
+}
+
+type V1DisaggregationMetrics struct {
+	Mode                    string  `json:"mode"`
+	PrefillPreallocQueueReqs int    `json:"prefill_prealloc_queue_reqs"`
+	PrefillInflightQueueReqs int    `json:"prefill_inflight_queue_reqs"`
+	DecodePreallocQueueReqs  int    `json:"decode_prealloc_queue_reqs"`
+	DecodeTransferQueueReqs  int    `json:"decode_transfer_queue_reqs"`
+	KvTransferSpeedGbS       float64 `json:"kv_transfer_speed_gb_s"`
+	KvTransferLatencyMs      float64 `json:"kv_transfer_latency_ms"`
 }
 
 type V1Aggregate struct {
@@ -467,9 +480,9 @@ type V1Aggregate struct {
 }
 
 func reportSglangMetrics(baseURL string, isDecodeMode bool) {
-	v1Load := false
-	if v := getEnvValue("V1_LOAD_API"); v == "true" {
-		v1Load = true
+	v1Load := true
+	if v := getEnvValue("V1_LOAD_API"); v == "false" {
+		v1Load = false
 	}
 
 	var loadURL string
@@ -547,6 +560,58 @@ func doReport(throughput float64, reportThroughputMax float64, logstr string) {
 	}
 }
 
+// calculatePrefillLoadScore 计算 prefill 负载评分（多因子加权）
+// 评分越小，负载越轻，越适合调度
+func calculatePrefillLoadScore(item V1LoadItem) float64 {
+	// 权重配置
+	const (
+		weightWaitingQueue    = 1.0
+		weightBootstrapQueue  = 0.8
+		weightInflightQueue   = 0.5
+		weightKVUsage         = 2.0
+		weightInputThroughput = -0.5 // 负权重=加成
+		weightCacheHitRate    = -1.0 // 负权重=加成
+	)
+
+	// 从嵌套的 disaggregation 中获取队列数据
+	preallocReqs := 0
+	inflightReqs := 0
+	if item.Disaggregation != nil {
+		preallocReqs = item.Disaggregation.PrefillPreallocQueueReqs
+		inflightReqs = item.Disaggregation.PrefillInflightQueueReqs
+	}
+
+	// 1. 队列深度评分（越多越差）
+	queueScore := float64(item.NumWaitingReqs)*weightWaitingQueue +
+		float64(preallocReqs)*weightBootstrapQueue +
+		float64(inflightReqs)*weightInflightQueue
+
+	// 2. KV cache 压力评分（使用率越高越差，放大到 0-10 范围）
+	kvScore := item.TokenUsage * 10 * weightKVUsage
+
+	// 3. 输入吞吐能力加成（吞吐越高越好，负权重）
+	throughputBonus := 0.0
+	if item.InputThroughput > 0 {
+		normalizedThroughput := math.Min(item.InputThroughput/10000.0, 1.0)
+		throughputBonus = normalizedThroughput * 10 * weightInputThroughput
+	}
+
+	// 4. 缓存命中率加成（命中率越高越好，负权重）
+	cacheBonus := item.CacheHitRate * 10 * weightCacheHitRate
+
+	// 5. 容量不足额外惩罚
+	capacityPenalty := 0.0
+	if item.TokenUsage > 0.9 {
+		capacityPenalty = 50.0
+	} else if item.TokenUsage > 0.8 {
+		capacityPenalty = 10.0
+	}
+
+	totalScore := queueScore + kvScore + throughputBonus + cacheBonus + capacityPenalty
+
+	return totalScore
+}
+
 func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
 	var v1Resp V1LoadResponse
 	if err := json.Unmarshal(body, &v1Resp); err != nil {
@@ -573,15 +638,23 @@ func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, 
 		return
 	}
 
-	// prefill: PromptTokensTotal is a cumulative counter, compute rate
-	*lastMetricValue = *newMetricValue
-	*newMetricValue = v1Resp.Aggregate.PromptTokensTotal
-	delta := *newMetricValue - *lastMetricValue
-	deltaTime := time.Since(*lastReportTime)
-	*lastReportTime = time.Now()
-	if deltaTime.Seconds() > 0 {
-		*throughput = delta / deltaTime.Seconds()
+	// prefill: 使用多因子加权评分
+	// score 越小负载越轻，直接上报 score 作为 throughput（代表压力）
+	// 在负载均衡器中，throughput 代表压力，越高越差，越不容易被调度
+	totalScore := 0.0
+	for _, item := range v1Resp.Loads {
+		totalScore += calculatePrefillLoadScore(item)
 	}
+
+	// 直接将 score 作为 throughput 上报（代表压力）
+	*throughput = totalScore
+
+	wLogger.Debugw("prefill load score",
+		"score", totalScore,
+		"throughput", *throughput,
+		"throughput_max", reportThroughputMax,
+		"loads", v1Resp.Loads,
+	)
 	doReport(*throughput, reportThroughputMax, logstr)
 }
 
