@@ -609,7 +609,8 @@ func calculatePrefillLoadScore(item V1LoadItem) float64 {
 
 	totalScore := queueScore + kvScore + throughputBonus + cacheBonus + capacityPenalty
 
-	return totalScore
+	// 确保评分非负（压力指标不应为负）
+	return math.Max(totalScore, 0)
 }
 
 func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
