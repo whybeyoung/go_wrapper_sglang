@@ -565,12 +565,10 @@ func doReport(throughput float64, reportThroughputMax float64, logstr string) {
 func calculatePrefillLoadScore(item V1LoadItem) float64 {
 	// 权重配置
 	const (
-		weightWaitingQueue    = 1.0
-		weightBootstrapQueue  = 0.8
-		weightInflightQueue   = 0.5
-		weightKVUsage         = 2.0
-		weightInputThroughput = -0.5 // 负权重=加成
-		weightCacheHitRate    = -1.0 // 负权重=加成
+		weightWaitingQueue   = 5.0  // 等待队列（最高权重，直接反映积压）
+		weightBootstrapQueue = 3.0  // Bootstrap 队列
+		weightInflightQueue  = 2.0  // Inflight 队列
+		weightTokenUsage     = 20.0 // KV cache 使用率（0~1 放大到 0~20）
 	)
 
 	// 从嵌套的 disaggregation 中获取队列数据
@@ -586,31 +584,20 @@ func calculatePrefillLoadScore(item V1LoadItem) float64 {
 		float64(preallocReqs)*weightBootstrapQueue +
 		float64(inflightReqs)*weightInflightQueue
 
-	// 2. KV cache 压力评分（使用率越高越差，放大到 0-10 范围）
-	kvScore := item.TokenUsage * 10 * weightKVUsage
+	// 2. KV cache 使用率（有 token 占用说明正在处理 prefill）
+	kvScore := item.TokenUsage * weightTokenUsage
 
-	// 3. 输入吞吐能力加成（吞吐越高越好，负权重）
-	throughputBonus := 0.0
-	if item.InputThroughput > 0 {
-		normalizedThroughput := math.Min(item.InputThroughput/10000.0, 1.0)
-		throughputBonus = normalizedThroughput * 10 * weightInputThroughput
-	}
-
-	// 4. 缓存命中率加成（命中率越高越好，负权重）
-	cacheBonus := item.CacheHitRate * 10 * weightCacheHitRate
-
-	// 5. 容量不足额外惩罚
+	// 3. 容量不足额外惩罚
 	capacityPenalty := 0.0
 	if item.TokenUsage > 0.9 {
-		capacityPenalty = 50.0
+		capacityPenalty = 100.0
 	} else if item.TokenUsage > 0.8 {
-		capacityPenalty = 10.0
+		capacityPenalty = 30.0
 	}
 
-	totalScore := queueScore + kvScore + throughputBonus + cacheBonus + capacityPenalty
+	totalScore := queueScore + kvScore + capacityPenalty
 
-	// 确保评分非负（压力指标不应为负）
-	return math.Max(totalScore, 0)
+	return totalScore
 }
 
 func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
@@ -2072,6 +2059,14 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 
 	// 如果没有搜索模板，直接返回解析后的消息和函数
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
+		return MessageParseResult{
+			Messages:  messages,
+			Functions: parseResult.Functions,
+		}
+	}
+
+	// 检查消息列表是否为空
+	if len(messages) == 0 {
 		return MessageParseResult{
 			Messages:  messages,
 			Functions: parseResult.Functions,
