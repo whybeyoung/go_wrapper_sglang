@@ -565,10 +565,11 @@ func doReport(throughput float64, reportThroughputMax float64, logstr string) {
 func calculatePrefillLoadScore(item V1LoadItem) float64 {
 	// 权重配置
 	const (
-		weightWaitingQueue   = 5.0  // 等待队列（最高权重，直接反映积压）
-		weightBootstrapQueue = 3.0  // Bootstrap 队列
-		weightInflightQueue  = 2.0  // Inflight 队列
-		weightTokenUsage     = 20.0 // KV cache 使用率（0~1 放大到 0~20）
+		weightWaitingQueue   = 5.0    // 等待队列（最高权重，直接反映积压）
+		weightBootstrapQueue = 3.0    // Bootstrap 队列
+		weightInflightQueue  = 2.0    // Inflight 队列
+		weightTokenUsage     = 20.0   // KV cache 使用率（0~1 放大到 0~20）
+		weightInputThroughput = 0.0003 // input_throughput 作为历史负载指标
 	)
 
 	// 从嵌套的 disaggregation 中获取队列数据
@@ -584,10 +585,14 @@ func calculatePrefillLoadScore(item V1LoadItem) float64 {
 		float64(preallocReqs)*weightBootstrapQueue +
 		float64(inflightReqs)*weightInflightQueue
 
-	// 2. KV cache 使用率（有 token 占用说明正在处理 prefill）
+	// 2. KV cache 使用率
 	kvScore := item.TokenUsage * weightTokenUsage
 
-	// 3. 容量不足额外惩罚
+	// 3. input_throughput 作为历史负载指标（上一个 prefill batch 的处理量）
+	// 在持续负载下，throughput 高的节点说明最近承担了更多工作
+	throughputScore := item.InputThroughput * weightInputThroughput
+
+	// 4. 容量不足额外惩罚
 	capacityPenalty := 0.0
 	if item.TokenUsage > 0.9 {
 		capacityPenalty = 100.0
@@ -595,10 +600,14 @@ func calculatePrefillLoadScore(item V1LoadItem) float64 {
 		capacityPenalty = 30.0
 	}
 
-	totalScore := queueScore + kvScore + capacityPenalty
+	totalScore := queueScore + kvScore + throughputScore + capacityPenalty
 
 	return totalScore
 }
+
+// prefillEWMA 维护 prefill score 的指数加权移动平均
+// 解决 prefill 太快导致采样时 score=0 无法区分节点的问题
+var prefillEWMA float64
 
 func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
 	var v1Resp V1LoadResponse
@@ -626,19 +635,25 @@ func doReportV1Loads(body []byte, isDecodeMode bool, lastReportTime *time.Time, 
 		return
 	}
 
-	// prefill: 使用多因子加权评分
-	// score 越小负载越轻，直接上报 score 作为 throughput（代表压力）
-	// 在负载均衡器中，throughput 代表压力，越高越差，越不容易被调度
-	totalScore := 0.0
+	// prefill: 使用多因子加权评分 + EWMA 平滑
+	// 解决 prefill 太快导致瞬时 score=0 无法区分节点的问题
+	// EWMA 让历史负载逐渐衰减，而不是瞬间归零
+	const ewmaAlpha = 0.3 // 平滑系数：越小历史权重越大，衰减越慢
+
+	instantScore := 0.0
 	for _, item := range v1Resp.Loads {
-		totalScore += calculatePrefillLoadScore(item)
+		instantScore += calculatePrefillLoadScore(item)
 	}
 
-	// 直接将 score 作为 throughput 上报（代表压力）
-	*throughput = totalScore
+	// EWMA: new = alpha * instant + (1-alpha) * history
+	prefillEWMA = ewmaAlpha*instantScore + (1-ewmaAlpha)*prefillEWMA
+
+	// 上报 EWMA 平滑后的值
+	*throughput = prefillEWMA
 
 	wLogger.Debugw("prefill load score",
-		"score", totalScore,
+		"instant_score", instantScore,
+		"ewma_score", prefillEWMA,
 		"throughput", *throughput,
 		"throughput_max", reportThroughputMax,
 		"loads", v1Resp.Loads,
