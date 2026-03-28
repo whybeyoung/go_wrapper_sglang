@@ -27,6 +27,14 @@ import (
 	gwsUtils "github.com/whybeyoung/go_wrapper_sglang/utils"
 )
 
+// truncateForLog returns at most limit runes from s. If truncated, it appends a suffix.
+func truncateForLog(s string, limit int) string {
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + fmt.Sprintf("... [truncated, total=%d]", len(runes))
+}
 type PatchRes struct {
 	InnerPatchId string
 	PatchId      string
@@ -367,17 +375,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 启动输出监控协程
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			fmt.Println(scanner.Text())
-		}
+		// 直接复制到标准输出，避免bufio.Scanner的行大小限制导致阻塞
+		_, _ = io.Copy(os.Stdout, stdout)
 	}()
 
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			fmt.Println(scanner.Text())
-		}
+		// 直接复制到标准错误，避免bufio.Scanner的行大小限制导致阻塞
+		_, _ = io.Copy(os.Stderr, stderr)
 	}()
 
 	// 启动监控协程
@@ -1031,7 +1035,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 		}
 
-		wLogger.Infow("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
+		wLogger.Infow("WrapperWrite processing data",
+			"data", truncateForLog(string(v.Data), 300),
+			"status", v.Status,
+			"sid", inst.sid,
+		)
 
 		streamReq, functions, thinking, err := buildStreamReq(inst, v)
 		if err != nil {
@@ -1133,8 +1141,8 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 						responseError(inst, err)
 						return
 					}
-					if index == 1 {
-						wLogger.Infow("WrapperWrite content first frame content", "response", toString(response), "sid", inst.sid)
+					if index == 1 || logLevel == "debug" {
+						wLogger.Infow("WrapperWrite index:1 or logLevel:debug frame content", "response", toString(response), "sid", inst.sid)
 					}
 					if len(response.Choices) > 0 {
 						var (
