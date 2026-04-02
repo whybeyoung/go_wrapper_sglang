@@ -1295,6 +1295,9 @@ func (inst *wrapperInst) handleNativeTokenizer(ctx context.Context) {
 					}
 				} else {
 					wLogger.Errorw("Recv error...", "error", err, "sid", inst.sid)
+					if cbErr := inst.callback(inst.usrTag, nil, err); cbErr != nil {
+						wLogger.Errorw("Recv error callback failed", "error", cbErr, "sid", inst.sid)
+					}
 				}
 			} else {
 				var chunkContent string
