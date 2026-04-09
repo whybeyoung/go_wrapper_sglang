@@ -480,19 +480,24 @@ type V1Aggregate struct {
 }
 
 func reportSglangMetrics(baseURL string, isDecodeMode bool) {
+	v1LoadV2 := false
+	if v := getEnvValue("LOAD_REPORT_V2"); v == "true" {
+		v1LoadV2 = true
+	}
+
 	v1Load := true
 	if v := getEnvValue("V1_LOAD_API"); v == "false" {
 		v1Load = false
 	}
 
 	var loadURL string
-	if v1Load {
+	if v1Load || v1LoadV2 {
 		loadURL = baseURL + "/v1/loads"
 	} else {
 		loadURL = baseURL + "/metrics"
 	}
 
-	wLogger.Debugw("sglang load report start", "url", loadURL, "v1Load", v1Load, "isDecodeMode", isDecodeMode)
+	wLogger.Debugw("sglang load report start", "url", loadURL, "v1Load", v1Load, "v1LoadV2", v1LoadV2, "isDecodeMode", isDecodeMode)
 	httpClient := http.Client{
 		Timeout: 3 * time.Second,
 	}
@@ -533,7 +538,9 @@ func reportSglangMetrics(baseURL string, isDecodeMode bool) {
 			continue
 		}
 
-		if v1Load {
+		if v1LoadV2 {
+			doReportV1LoadsV2(body, isDecodeMode, &lastReportTime, &lastMetricValue, &newMetricValue, &throughput, logstr)
+		} else if v1Load {
 			doReportV1Loads(body, isDecodeMode, &lastReportTime, &lastMetricValue, &newMetricValue, &throughput, logstr)
 		} else {
 			doReportMetrics(body, isDecodeMode, &lastReportTime, &lastMetricValue, &newMetricValue, &throughput, &hasGenerationTokensTotal, generationTokenMetric, logstr)
@@ -558,6 +565,85 @@ func doReport(throughput float64, reportThroughputMax float64, logstr string) {
 			wLogger.Errorw("lb extra func report failed", "err", err.Error())
 		}
 	}
+}
+
+func doReportV2(throughput float64, reportThroughputMax float64, waitingQueue int, tokenUsage float64, logstr string) {
+	wrapperInfo := map[string]any{
+		"throughput":     throughput,
+		"throughput_max": reportThroughputMax,
+		"waiting_queue":  waitingQueue,
+		"token_usage":    tokenUsage,
+	}
+	wrapperInfoBytes, _ := json.Marshal(wrapperInfo)
+	res := map[string]string{
+		"wrapper_info": string(wrapperInfoBytes),
+	}
+	wLogger.Debugw(logstr, "throughput", throughput, "throughput_max", reportThroughputMax, "waiting_queue", waitingQueue, "token_usage", tokenUsage)
+	if LbExtraFunc != nil {
+		if err := LbExtraFunc(res); err != nil {
+			wLogger.Errorw("lb extra func report failed", "err", err.Error())
+		}
+	}
+}
+
+func doReportV1LoadsV2(body []byte, isDecodeMode bool, lastReportTime *time.Time, lastMetricValue *float64, newMetricValue *float64, throughput *float64, logstr string) {
+	var v1Resp V1LoadResponse
+	if err := json.Unmarshal(body, &v1Resp); err != nil {
+		wLogger.Errorw("v1/loads v2 parse json failed", "err", err.Error(), "body", string(body))
+		return
+	}
+
+	reportThroughputMax := throughputMax
+	if reportThroughputMax <= 0 {
+		totalMaxTokens := 0
+		for _, item := range v1Resp.Loads {
+			totalMaxTokens += item.MaxTotalNumTokens
+		}
+		reportThroughputMax = float64(totalMaxTokens)
+	}
+
+	// 聚合额外指标
+	totalWaitingReqs := 0
+	totalTokenUsage := float64(0)
+	for _, item := range v1Resp.Loads {
+		totalWaitingReqs += item.NumWaitingReqs
+		totalTokenUsage += item.TokenUsage
+	}
+	avgTokenUsage := float64(0)
+	if len(v1Resp.Loads) > 0 {
+		avgTokenUsage = totalTokenUsage / float64(len(v1Resp.Loads))
+	}
+
+	if isDecodeMode {
+		totalGenThroughput := float64(0)
+		for _, item := range v1Resp.Loads {
+			totalGenThroughput += item.GenThroughput
+		}
+		*throughput = totalGenThroughput
+		doReportV2(*throughput, reportThroughputMax, totalWaitingReqs, avgTokenUsage, logstr)
+		return
+	}
+
+	// prefill: 多因子加权评分 + EWMA 平滑（与 doReportV1Loads 逻辑一致）
+	const ewmaAlpha = 0.3
+
+	instantScore := 0.0
+	for _, item := range v1Resp.Loads {
+		instantScore += calculatePrefillLoadScore(item)
+	}
+	prefillEWMA = ewmaAlpha*instantScore + (1-ewmaAlpha)*prefillEWMA
+	*throughput = prefillEWMA
+
+	wLogger.Debugw("prefill load score v2",
+		"instant_score", instantScore,
+		"ewma_score", prefillEWMA,
+		"throughput", *throughput,
+		"throughput_max", reportThroughputMax,
+		"waiting_queue", totalWaitingReqs,
+		"token_usage", avgTokenUsage,
+		"loads", v1Resp.Loads,
+	)
+	doReportV2(*throughput, reportThroughputMax, totalWaitingReqs, avgTokenUsage, logstr)
 }
 
 // calculatePrefillLoadScore 计算 prefill 负载评分（多因子加权）
