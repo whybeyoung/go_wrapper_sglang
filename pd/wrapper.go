@@ -857,6 +857,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		"TOOL_CALL_PARSER", getEnvValue("TOOL_CALL_PARSER"),
 		"ENABLE_METRICS", getEnvValue("ENABLE_METRICS"),
 		"IS_REASONING_MODEL", getEnvValue("IS_REASONING_MODEL"),
+		"ENABLE_AUTO_TOOL_CHOICE", getEnvValue("ENABLE_AUTO_TOOL_CHOICE"),
 	)
 
 	if promptSearchTemplate != "" {
@@ -1984,13 +1985,21 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			}
 			if toolChoiceStr, ok := inst.params["tool_choice"]; ok && toolChoiceStr != "" {
 				wLogger.Infow("WrapperWrite toolChoiceStr", "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
-				if strings.HasPrefix(toolChoiceStr, "{") {
-					toolChoice := openai.ToolChoice{}
-					err := json.Unmarshal([]byte(toolChoiceStr), &toolChoice)
-					if err != nil {
-						wLogger.Errorw("WrapperWrite unmarshal toolChoiceStr error", "error", err, "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+				trimmedToolChoice := strings.TrimSpace(toolChoiceStr)
+				// 默认 true：仅当 ENABLE_AUTO_TOOL_CHOICE=false 时保留 JSON object 形式的 tool_choice
+				enableAutoToolChoice := getEnvValue("ENABLE_AUTO_TOOL_CHOICE") != "false"
+				if strings.HasPrefix(trimmedToolChoice, "{") {
+					if enableAutoToolChoice {
+						streamReq.ToolChoice = "auto"
+						wLogger.Infow("WrapperWrite tool_choice JSON object coerced to auto", "sid", inst.sid)
 					} else {
-						streamReq.ToolChoice = toolChoice
+						toolChoice := openai.ToolChoice{}
+						err := json.Unmarshal([]byte(toolChoiceStr), &toolChoice)
+						if err != nil {
+							wLogger.Errorw("WrapperWrite unmarshal toolChoiceStr error", "error", err, "sid", inst.sid, "toolChoiceStr", toolChoiceStr)
+						} else {
+							streamReq.ToolChoice = toolChoice
+						}
 					}
 				} else {
 					toolChoiceStr = strings.ReplaceAll(toolChoiceStr, "\"", "")
