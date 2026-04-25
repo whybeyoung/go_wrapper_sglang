@@ -143,6 +143,7 @@ type wrapperInst struct {
 	thinkingMode        bool       // 添加标志位记录 thinking 模式
 	jsonMode            bool       // 添加标志位记录 json 模式
 	functionCallMode    bool       // 添加标志位记录 function call 模式
+	streamContent       []byte     // 流式多帧输入缓存
 }
 
 // schemaMarshaler 自定义的 Marshaler 类型
@@ -1790,6 +1791,30 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 	for _, v := range req {
 		if v.Key == "__kv_info" {
 			continue // 跳过kv_info数据
+		}
+		// 适配流式请求：如果不是结束帧，则累积数据，等待结束帧再统一处理
+		if v.Status != comwrapper.DataEnd {
+			if len(inst.streamContent) == 0 {
+				inst.streamContent = v.Data
+			} else {
+				inst.streamContent = append(inst.streamContent, v.Data...)
+			}
+			wLogger.Infow("WrapperWrite buffering stream frame",
+				"sid", inst.sid,
+				"status", v.Status,
+				"frameLen", len(v.Data),
+				"bufferedLen", len(inst.streamContent),
+			)
+			continue
+		} else {
+			if inst.streamContent != nil {
+				v.Data = append(inst.streamContent, v.Data...)
+				wLogger.Infow("WrapperWrite stream end, merged buffered frames",
+					"sid", inst.sid,
+					"totalLen", len(v.Data),
+				)
+				inst.streamContent = nil
+			}
 		}
 		wLogger.Debugw("WrapperWrite processing data", "data", string(v.Data), "status", v.Status, "sid", inst.sid)
 
