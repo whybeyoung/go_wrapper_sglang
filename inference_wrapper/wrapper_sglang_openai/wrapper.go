@@ -2035,7 +2035,7 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 
 			case []interface{}:
 				multiContent := make([]openai.ChatMessagePart, 0)
-				wLogger.Infow("convertToOpenAIMessages multi content", "content", msg.Content, "contentType", fmt.Sprintf("%T", msg.Content))
+				wLogger.Infow("convertToOpenAIMessages multi content", "content", jsonStringTruncatedForLog(msg.Content, streamReqLargeJSONLogRuneLimit), "contentType", fmt.Sprintf("%T", msg.Content))
 
 				// 遍历每个元素并转换为ChatMessagePart
 				for _, item := range v {
