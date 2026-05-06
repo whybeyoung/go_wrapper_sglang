@@ -34,6 +34,7 @@ func truncateForLog(s string, limit int) string {
 	}
 	return string(runes[:limit]) + fmt.Sprintf("... [truncated, total=%d]", len(runes))
 }
+
 type PatchRes struct {
 	InnerPatchId string
 	PatchId      string
@@ -621,6 +622,66 @@ func toString(v any) string {
 	return string(res)
 }
 
+// streamReqLargeJSONLogRuneLimit truncates only the JSON-serialized messages/tools blobs in debug logs.
+const streamReqLargeJSONLogRuneLimit = 4096
+
+func jsonStringForLog(v any) string {
+	if v == nil {
+		return "null"
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("<json.Marshal err: %v type=%T>", err, v)
+	}
+	return string(b)
+}
+
+func jsonStringTruncatedForLog(v any, limit int) string {
+	return truncateForLog(jsonStringForLog(v), limit)
+}
+
+// logStreamReq logs ChatCompletionRequest by field; only messages and tools are truncated when too long.
+func logStreamReq(req *openai.ChatCompletionRequest, sid string) {
+	if req == nil {
+		wLogger.Infow("WrapperWrite streamReq", "sid", sid, "req", nil)
+		return
+	}
+	lim := streamReqLargeJSONLogRuneLimit
+	var seed any
+	if req.Seed != nil {
+		seed = *req.Seed
+	}
+	wLogger.Infow("WrapperWrite streamReq",
+		"sid", sid,
+		"model", req.Model,
+		"messages", jsonStringTruncatedForLog(req.Messages, lim),
+		"max_tokens", req.MaxTokens,
+		"max_completion_tokens", req.MaxCompletionTokens,
+		"temperature", req.Temperature,
+		"top_p", req.TopP,
+		"n", req.N,
+		"stream", req.Stream,
+		"stop", req.Stop,
+		"presence_penalty", req.PresencePenalty,
+		"frequency_penalty", req.FrequencyPenalty,
+		"response_format", req.ResponseFormat,
+		"seed", seed,
+		"logit_bias", req.LogitBias,
+		"logprobs", req.LogProbs,
+		"top_logprobs", req.TopLogProbs,
+		"user", req.User,
+		"functions", req.Functions,
+		"function_call", req.FunctionCall,
+		"tools", jsonStringTruncatedForLog(req.Tools, lim),
+		"tool_choice", req.ToolChoice,
+		"parallel_tool_calls", req.ParallelToolCalls,
+		"stream_options", req.StreamOptions,
+		"store", req.Store,
+		"metadata", req.Metadata,
+		"extra_body", req.ExtraBody,
+	)
+}
+
 // schemaMarshaler 自定义的 Marshaler 类型
 type schemaMarshaler struct {
 	data []byte
@@ -1067,7 +1128,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// 	},
 		// 	TopP: float32(topP),
 		// }
-		wLogger.Infof("WrapperWrite streamReq:%v, %v\n", toString(streamReq), inst.sid)
+		logStreamReq(streamReq, inst.sid)
 
 		// 使用协程处理流式请求
 		go func(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
