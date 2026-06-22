@@ -835,6 +835,7 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		mt   = 0
 		tp   = float64(0)
 		stop []string
+		topK = -1
 	)
 	if tempStr, ok := inst.params["temperature"]; ok {
 		if t, err := strconv.ParseFloat(tempStr, 64); err == nil {
@@ -859,6 +860,13 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 			wLogger.Warnw("Invalid top_p value", "value", tpStr, "sid", inst.sid)
 		}
 	}
+	if tk, ok := inst.params["top_k"]; ok {
+		if t, err := strconv.Atoi(tk); err == nil {
+			topK = t
+		} else {
+			wLogger.Warnw("Invalid top_k value", "value", tk, "sid", inst.sid)
+		}
+	}
 
 	streamReq := &openai.ChatCompletionRequest{
 		Model: DEFAULT_MODEL_NAME,
@@ -873,8 +881,9 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	if mt > 0 {
 		streamReq.MaxTokens = mt
 	}
-	if temp > 0 {
-		streamReq.Temperature = float32(temp)
+	if temp >= 0 {
+		temp32 := float32(temp)
+		streamReq.Temperature = &temp32
 	}
 	if tp > 0 {
 		streamReq.TopP = float32(tp)
@@ -1040,6 +1049,9 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 	if inst.continueFinalMessage {
 		streamReq.ExtraBody["continue_final_message"] = true
+	}
+	if topK > 0 {
+		streamReq.ExtraBody["top_k"] = topK
 	}
 	if len(stop) > 0 {
 		streamReq.Stop = stop
