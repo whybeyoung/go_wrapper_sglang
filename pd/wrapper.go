@@ -1145,10 +1145,10 @@ func WrapperCreate(usrTag string, params map[string]string, prsIds []int, cb com
 	}
 	if inst.SessionManager != nil {
 		inst.SessionManager.AddRequest(inst.sid, inst) // 传入 inst 指针
-		wLogger.Infow("WrapperCreate added request state for pd mode", "sid", inst.sid, "appId", inst.appId)
+		wLogger.Debugw("WrapperCreate added request state for pd mode", "sid", inst.sid, "appId", inst.appId)
 	}
 
-	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag)
+	wLogger.Infow("WrapperCreate successful", "sid", sid, "usrTag", usrTag, "appId", appId)
 	return unsafe.Pointer(inst), nil
 }
 
@@ -1874,10 +1874,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 				stop = extraParams.Stop[:maxStopWords]
 			} else {
 				stop = extraParams.Stop
-				wLogger.Warnw("WrapperWrite stop words", "stop", extraParams.Stop, "sid", inst.sid)
-
 			}
-
 		}
 		if extraParams.ContinueFinalMessage {
 			inst.continueFinalMessage = true
@@ -2290,8 +2287,39 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	}
 }
 
+// marshalUpstreamRequestForLog 还原 go-openai 实际发送给 sglang 的请求体：
+// 1) 将 extra_body 展开合并到顶层；2) 禁用 HTML 转义，保证 < > & 等字符按字面量输出。
+func marshalUpstreamRequestForLog(req *openai.ChatCompletionRequest) string {
+	jsonBytes, err := json.Marshal(req)
+	if err != nil {
+		return ""
+	}
+	var bodyMap map[string]any
+	if err := json.Unmarshal(jsonBytes, &bodyMap); err != nil {
+		return ""
+	}
+	if extra, ok := bodyMap["extra_body"].(map[string]any); ok {
+		for k, v := range extra {
+			bodyMap[k] = v
+		}
+	}
+	delete(bodyMap, "extra_body")
+
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(bodyMap); err != nil {
+		return ""
+	}
+	return strings.TrimRight(buf.String(), "\n")
+}
+
 func (inst *wrapperInst) StreamOAI(req *openai.ChatCompletionRequest, status comwrapper.DataStatus) {
-	wLogger.Infow("WrapperWrite Upstream starting stream inference", "sid", inst.sid)
+	// 打印发送给 sglang 服务的原始请求体（与 go-openai 实际通过 HTTP 发送的 JSON 一致：
+	// extra_body 会被展开合并到顶层，且禁用 HTML 转义）
+	if rawBody := marshalUpstreamRequestForLog(req); rawBody != "" {
+		wLogger.Infow("StreamOAI upstream raw request", "sid", inst.sid, "request", rawBody)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeDDL)
 	defer cancel()
