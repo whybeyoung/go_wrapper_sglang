@@ -173,6 +173,7 @@ type ExtraParams struct {
 	} `json:"response_format,omitempty"`
 	LogitBias            map[string]int `json:"logit_bias,omitempty"`
 	ContinueFinalMessage bool           `json:"continue_final_message,omitempty"`
+	ReasoningEffort      string         `json:"reasoning_effort,omitempty"`
 }
 
 // app_Id
@@ -1882,6 +1883,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if extraParams.LogitBias != nil {
 			inst.logitBias = extraParams.LogitBias
 		}
+		reasoningEffort := extraParams.ReasoningEffort
 		wLogger.Infow("WrapperWrite request parameters",
 			"sid", inst.sid,
 			"appId", inst.appId,
@@ -1890,6 +1892,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			"stop", stop,
 			"continueFinalMessage", inst.continueFinalMessage,
 			"logitBias", inst.logitBias,
+			"reasoningEffort", reasoningEffort,
 		)
 
 		// 从请求体 v.Data 中解析 parameters 字段（兼容框架嵌套传参方式）
@@ -2050,6 +2053,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		// use stop
 		if len(stop) > 0 {
 			streamReq.Stop = stop
+		}
+
+		// 透传 reasoning_effort 到 sglang（经 extra_body 合并到顶层）
+		if reasoningEffort != "" {
+			streamReq.ExtraBody["reasoning_effort"] = reasoningEffort
 		}
 
 		if inst.continueFinalMessage {
