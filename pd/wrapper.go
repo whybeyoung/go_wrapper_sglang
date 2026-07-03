@@ -2094,6 +2094,11 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if responseFormat.Type != "" {
 			streamReq.ResponseFormat = &responseFormat
 		}
+		// reasoning_effort 为 none/minimal 时强制关闭思考
+		if re := strings.ToLower(strings.TrimSpace(reasoningEffort)); re == "none" || re == "minimal" {
+			enableThinking = false
+			wLogger.Infow("WrapperWrite reasoning_effort disables thinking", "sid", inst.sid, "reasoningEffort", reasoningEffort)
+		}
 		chatTemplateKwargs := map[string]interface{}{
 			"enable_thinking": enableThinking,
 			"thinking":        enableThinking,
