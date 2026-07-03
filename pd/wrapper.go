@@ -2055,11 +2055,6 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			streamReq.Stop = stop
 		}
 
-		// 透传 reasoning_effort 到 sglang（经 extra_body 合并到顶层）
-		if reasoningEffort != "" {
-			streamReq.ExtraBody["reasoning_effort"] = reasoningEffort
-		}
-
 		if inst.continueFinalMessage {
 			streamReq.ExtraBody["continue_final_message"] = true
 		}
@@ -2099,10 +2094,15 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		if responseFormat.Type != "" {
 			streamReq.ResponseFormat = &responseFormat
 		}
-		streamReq.ExtraBody["chat_template_kwargs"] = map[string]interface{}{
+		chatTemplateKwargs := map[string]interface{}{
 			"enable_thinking": enableThinking,
 			"thinking":        enableThinking,
 		}
+		// 透传 reasoning_effort，与 thinking 一样走 chat_template_kwargs
+		if reasoningEffort != "" {
+			chatTemplateKwargs["reasoning_effort"] = reasoningEffort
+		}
+		streamReq.ExtraBody["chat_template_kwargs"] = chatTemplateKwargs
 		// 使用协程处理流式请求
 		go inst.StreamOAI(streamReq, v.Status)
 	}
