@@ -2025,7 +2025,13 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 					}
 				} else {
 					toolChoiceStr = strings.ReplaceAll(toolChoiceStr, "\"", "")
-					streamReq.ToolChoice = toolChoiceStr
+					// 默认 true：当 ENABLE_AUTO_TOOL_CHOICE 非 false 时，将 required 也转为 auto
+					if enableAutoToolChoice && strings.EqualFold(strings.TrimSpace(toolChoiceStr), "required") {
+						streamReq.ToolChoice = "auto"
+						wLogger.Infow("WrapperWrite tool_choice required coerced to auto", "sid", inst.sid)
+					} else {
+						streamReq.ToolChoice = toolChoiceStr
+					}
 				}
 			} else {
 				streamReq.ToolChoice = "auto"
