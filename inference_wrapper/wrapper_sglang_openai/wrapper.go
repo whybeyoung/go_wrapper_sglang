@@ -1034,9 +1034,13 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	if extraParams.LogitBias != nil {
 		streamReq.LogitBias = extraParams.LogitBias
 	}
-
-	openaiMsgs, functions := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 	thinking := false
+	openaiMsgs, functions,err := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+	if err != nil {
+		wLogger.Errorw("formatMessages", "error", err, "sid", inst.sid)
+		return streamReq, functions, thinking, err
+	}
+	
 	if isReasoningModel {
 		lastMsg := openaiMsgs[len(openaiMsgs)-1]
 		if lastMsg.Role != "assistant" {
@@ -1774,15 +1778,17 @@ func contentToString(content interface{}) string {
 }
 
 // formatMessages 格式化消息，支持搜索模板
-func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition) {
+func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate string, promptSearchTemplateNoIndex string) ([]Message, []openai.FunctionDefinition, error) {
 	messages, functions := parseMessages(prompt)
 	wLogger.Debugf("formatMessages messages: %v\n, functions:%v", messages, functions)
 
 	// 如果没有搜索模板，直接返回解析后的消息
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
-		return messages, functions
+		return messages, functions, nil
 	}
-
+	if len(messages) = 0 {
+		return messages, functions, fmt.Errorf("messages get failed: %v", prompt)
+	}
 	lastMessage := &messages[len(messages)-1]
 	if lastMessage.Role == "assistant" {
 		if lastMessage.Prefix != nil && *lastMessage.Prefix {
@@ -1802,7 +1808,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 
 	// 如果没有tool消息，直接返回
 	if lastToolMsg == nil {
-		return messages, functions
+		return messages, functions, nil
 	}
 
 	// 解析tool消息内容
@@ -1810,12 +1816,12 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	var searchContent []map[string]interface{}
 	if err := json.Unmarshal([]byte(contentStr), &searchContent); err != nil {
 		wLogger.Errorw("Failed to parse tool message content", "error", err)
-		return messages, functions
+		return messages, functions, nil
 	}
 
 	// 如果没有搜索内容，直接返回
 	if len(searchContent) == 0 {
-		return messages, functions
+		return messages, functions, nil
 	}
 
 	// 获取show_ref_label，默认为false
@@ -1880,7 +1886,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			tmpl, err := template.New("search").Parse(templateStr)
 			if err != nil {
 				wLogger.Errorw("Failed to parse template", "error", err)
-				return messages, functions
+				return messages, functions, nil
 			}
 
 			// 准备模板数据
@@ -1898,7 +1904,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 			var result strings.Builder
 			if err := tmpl.Execute(&result, data); err != nil {
 				wLogger.Errorw("Failed to execute template", "error", err)
-				return messages, functions
+				return messages, functions, nil
 			}
 			if addWebsearchContent && addIndex != -1 {
 				args := map[string]string{
@@ -1907,7 +1913,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 				argsJSON, err := json.Marshal(args)
 				if err != nil {
 					wLogger.Errorw("Failed to marshal tool call arguments", "error", err)
-					return messages, functions
+					return messages, functions, nil
 				}
 				messages[addIndex].ToolCalls = []openai.ToolCall{
 					{
@@ -1925,7 +1931,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 		}
 	}
 
-	return messages, functions
+	return messages, functions, nil
 }
 
 func (inst *wrapperInst) abortRequest(sid string) {
