@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"comwrapper"
 	"context"
@@ -761,6 +760,67 @@ func (sm *SessionManager) AddRequest(rid string, inst *wrapperInst) *ReqState {
 	return state
 }
 
+// 获取宿主机 GPU UUID -> 真实物理索引 map
+func getGPUUUIDMap() (map[string]string, error) {
+	cmd := exec.Command("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	uuidMap := make(map[string]string)
+	lines := strings.Split(string(out), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// 格式示例： 0, GPU-fb1d5dd5-3584-90c1-ab33-37a8790a51b2
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 {
+			continue
+		}
+		index := strings.TrimSpace(parts[0])
+		uuid := strings.TrimSpace(parts[1])
+		uuidMap[uuid] = index
+	}
+
+	return uuidMap, nil
+}
+
+// 转换 NVIDIA_VISIBLE_DEVICES → 真实机器GPU编号
+func GetRealGPUIndexes() string {
+	env := os.Getenv("NVIDIA_VISIBLE_DEVICES")
+	if env == "" {
+		return ""
+	}
+
+	uuidMap, err := getGPUUUIDMap()
+	if err != nil {
+		return env // 失败就返回原值
+	}
+
+	parts := strings.Split(env, ",")
+	var realIndexes []string
+
+	for _, part := range parts {
+		dev := strings.TrimSpace(part)
+
+		// GPU-UUID 格式 → 查真实索引
+		if strings.HasPrefix(dev, "GPU-") {
+			if idx, ok := uuidMap[dev]; ok {
+				realIndexes = append(realIndexes, idx)
+			}
+		} else {
+			// 已经是数字，直接用
+			realIndexes = append(realIndexes, dev)
+		}
+	}
+        fmt.Println("realIndexes", strings.Join(realIndexes, ","))
+	return strings.Join(realIndexes, ",")
+}
+
 // WrapperInit 插件初始化, 全局只调用一次. 本地调试时, cfg参数由aiges.toml提供
 func WrapperInit(cfg map[string]string) (err error) {
 	fmt.Println("---- wrapper init ----")
@@ -929,7 +989,17 @@ func WrapperInit(cfg map[string]string) (err error) {
 	// 检查PD模式
 	pdType := getEnvValue("AIGES_PD_ROLE")
 
-	leaderAddr := getEnvValue("LWS_LEADER_ADDRESS")
+	rbgVersion := strings.ToLower(getEnvValue("RBG_VERSION"))
+	leaderAddrKey := "LWS_LEADER_ADDRESS"
+	groupSizeKey := "LWS_GROUP_SIZE"
+	workerIndexKey := "LWS_WORKER_INDEX"
+	if rbgVersion == "v1alpha2" {
+		leaderAddrKey = "RBG_LWP_LEADER_ADDRESS"
+		groupSizeKey = "RBG_LWP_GROUP_SIZE"
+		workerIndexKey = "RBG_LWP_WORKER_INDEX"
+	}
+
+	leaderAddr := getEnvValue(leaderAddrKey)
 	if leaderAddr != "" {
 		var err error
 		sessionManager, err = NewSessionManager(leaderAddr, zmqPort, pdType)
@@ -1014,7 +1084,7 @@ func WrapperInit(cfg map[string]string) (err error) {
 		wLogger.Infow("Multi-node mode enabled")
 
 		// 获取组大小
-		if groupSize := getEnvValue("LWS_GROUP_SIZE"); groupSize != "" {
+		if groupSize := getEnvValue(groupSizeKey); groupSize != "" {
 			extraArgs += fmt.Sprintf(" --nnodes %s", groupSize)
 		}
 
@@ -1029,13 +1099,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 		}
 
 		// 获取worker索引
-		if workerIndex := getEnvValue("LWS_WORKER_INDEX"); workerIndex != "" {
+		if workerIndex := getEnvValue(workerIndexKey); workerIndex != "" {
 			extraArgs += fmt.Sprintf(" --node-rank %s", workerIndex)
 		}
 	}
 
 	// yaml 开启特权模式，能识别到所有的GPU，非整机的服务会部署到相同的GPU节点
-	os.Setenv("CUDA_VISIBLE_DEVICES", getEnvValue("NVIDIA_VISIBLE_DEVICES"))
+	os.Setenv("CUDA_VISIBLE_DEVICES", GetRealGPUIndexes())
 
 	// 构建完整的启动命令
 	args := []string{
