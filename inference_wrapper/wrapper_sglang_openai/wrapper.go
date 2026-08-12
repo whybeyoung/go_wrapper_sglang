@@ -1863,7 +1863,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 				}
 				addIndex = i
 
-				if messages[addIndex-1].Role != "assistant" {
+				if addIndex > 1 && messages[addIndex-1].Role != "assistant" {
 					newMessages := make([]Message, 0, len(messages)+1)
 					newMessages = append(newMessages, messages[:addIndex]...)
 					newMessages = append(newMessages, Message{
