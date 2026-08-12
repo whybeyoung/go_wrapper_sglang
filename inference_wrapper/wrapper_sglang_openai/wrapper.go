@@ -706,6 +706,7 @@ type ExtraParams struct {
 	ReasoningEffort      string         `json:"reasoning_effort,omitempty"`
 	FrequencyPenalty     *float32       `json:"frequency_penalty,omitempty"`
 	PresencePenalty      *float32       `json:"presence_penalty,omitempty"`
+	RepetitionPenalty    *float32       `json:"repetition_penalty,omitempty"`
 	ContinueFinalMessage bool           `json:"continue_final_message,omitempty"`
 	Stop                 []string       `json:"stop,omitempty"`
 	SkipSpecialTokens    *bool          `json:"skip_special_tokens,omitempty"`
@@ -831,7 +832,7 @@ func openaiFunctionCall(inst *wrapperInst, functions []openai.FunctionDefinition
 func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.ChatCompletionRequest, []openai.FunctionDefinition, bool, error) {
 	// 从params中获取参数, 否则不传
 	var (
-		temp = float64(0)
+		temp *float32 // 使用指针类型区分"未设置"和"设置为0"
 		mt   = 0
 		tp   = float64(0)
 		stop []string
@@ -839,7 +840,8 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	)
 	if tempStr, ok := inst.params["temperature"]; ok {
 		if t, err := strconv.ParseFloat(tempStr, 64); err == nil {
-			temp = t
+			t32 := float32(t)
+			temp = &t32
 		} else {
 			wLogger.Warnw("Invalid temperature value", "value", tempStr, "sid", inst.sid)
 		}
@@ -876,14 +878,14 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		"temperature", temp,
 		"maxTokens", mt,
 		"topP", tp,
+		"topK", topK,
 		"param", inst.params,
 	)
 	if mt > 0 {
 		streamReq.MaxTokens = mt
 	}
-	if temp >= 0 {
-		temp32 := float32(temp)
-		streamReq.Temperature = &temp32
+	if temp != nil {
+		streamReq.Temperature = temp
 	}
 	if tp > 0 {
 		streamReq.TopP = float32(tp)
@@ -982,6 +984,9 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 	}
 	if extraParams.PresencePenalty != nil {
 		streamReq.PresencePenalty = *extraParams.PresencePenalty
+	}
+	if extraParams.RepetitionPenalty != nil {
+		streamReq.ExtraBody["repetition_penalty"] = *extraParams.RepetitionPenalty
 	}
 	if extraParams.ContinueFinalMessage {
 		inst.continueFinalMessage = true
