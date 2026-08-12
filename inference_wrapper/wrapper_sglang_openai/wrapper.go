@@ -1791,7 +1791,7 @@ func (inst *wrapperInst) formatMessages(prompt string, promptSearchTemplate stri
 	if promptSearchTemplate == "" && promptSearchTemplateNoIndex == "" {
 		return messages, functions, nil
 	}
-	if len(messages) = 0 {
+	if len(messages) == 0 {
 		return messages, functions, fmt.Errorf("messages get failed: %v", prompt)
 	}
 	lastMessage := &messages[len(messages)-1]
