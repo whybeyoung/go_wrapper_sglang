@@ -1140,17 +1140,13 @@ func WrapperInit(cfg map[string]string) (err error) {
 
 	// 启动输出监控协程
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			fmt.Println(scanner.Text())
-		}
+		// 直接复制到标准输出，避免bufio.Scanner的行大小限制导致阻塞
+		_, _ = io.Copy(os.Stdout, stdout)
 	}()
 
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			fmt.Println(scanner.Text())
-		}
+		// 直接复制到标准错误，避免bufio.Scanner的行大小限制导致阻塞
+		_, _ = io.Copy(os.Stderr, stderr)
 	}()
 
 	// 启动监控协程
