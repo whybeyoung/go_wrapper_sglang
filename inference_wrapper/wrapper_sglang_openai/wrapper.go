@@ -623,7 +623,23 @@ func toString(v any) string {
 }
 
 // streamReqLargeJSONLogRuneLimit truncates only the JSON-serialized messages/tools blobs in debug logs.
-const streamReqLargeJSONLogRuneLimit = 4096
+// Overridable via the STREAM_REQ_LARGE_JSON_LOG_RUNE_LIMIT environment variable.
+var streamReqLargeJSONLogRuneLimit = envIntOrDefault("STREAM_REQ_LARGE_JSON_LOG_RUNE_LIMIT", 4096)
+
+// envIntOrDefault reads an int from the given environment variable, falling back to def
+// when unset or unparseable.
+func envIntOrDefault(key string, def int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		wLogger.Warnf("envIntOrDefault %s=%q invalid, using default %d: %v", key, s, def, err)
+		return def
+	}
+	return v
+}
 
 func jsonStringForLog(v any) string {
 	if v == nil {
@@ -1040,12 +1056,12 @@ func buildStreamReq(inst *wrapperInst, req comwrapper.WrapperData) (*openai.Chat
 		streamReq.LogitBias = extraParams.LogitBias
 	}
 	thinking := false
-	openaiMsgs, functions,err := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
+	openaiMsgs, functions, err := inst.formatMessages(string(req.Data), promptSearchTemplate, promptSearchTemplateNoIndex)
 	if err != nil {
 		wLogger.Errorw("formatMessages", "error", err, "sid", inst.sid)
 		return streamReq, functions, thinking, err
 	}
-	
+
 	if isReasoningModel {
 		lastMsg := openaiMsgs[len(openaiMsgs)-1]
 		if lastMsg.Role != "assistant" {
@@ -1117,7 +1133,7 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 		}
 
 		wLogger.Infow("WrapperWrite processing data",
-			"data", truncateForLog(string(v.Data), 300),
+			"data", truncateForLog(string(v.Data), streamReqLargeJSONLogRuneLimit),
 			"status", v.Status,
 			"sid", inst.sid,
 		)
@@ -1983,12 +1999,13 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role         string            `json:"role"`
-	Content      interface{}       `json:"content"`
-	ShowRefLabel *bool             `json:"show_ref_label,omitempty"`
-	Prefix       *bool             `json:"prefix,omitempty"` // for continue final message
-	ToolCalls    []openai.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID   string            `json:"tool_call_id,omitempty"`
+	Role             string            `json:"role"`
+	Content          interface{}       `json:"content"`
+	ReasoningContent string            `json:"reasoning_content"`
+	ShowRefLabel     *bool             `json:"show_ref_label,omitempty"`
+	Prefix           *bool             `json:"prefix,omitempty"` // for continue final message
+	ToolCalls        []openai.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
 }
 
 // Tool 工具结构
@@ -2045,9 +2062,10 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 	openAIMessages := make([]openai.ChatCompletionMessage, len(messages))
 	for i, msg := range messages {
 		openAIMessages[i] = openai.ChatCompletionMessage{
-			Role:       msg.Role,
-			ToolCalls:  msg.ToolCalls,
-			ToolCallID: msg.ToolCallID,
+			Role:             msg.Role,
+			ToolCalls:        msg.ToolCalls,
+			ToolCallID:       msg.ToolCallID,
+			ReasoningContent: msg.ReasoningContent,
 		}
 		content := ""
 		if msg.Content != nil {
