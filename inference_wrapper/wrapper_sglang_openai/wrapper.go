@@ -2001,6 +2001,7 @@ type ChatCompletionRequest struct {
 type Message struct {
 	Role             string            `json:"role"`
 	Content          interface{}       `json:"content"`
+	Name             string            `json:"name"`
 	ReasoningContent string            `json:"reasoning_content"`
 	ShowRefLabel     *bool             `json:"show_ref_label,omitempty"`
 	Prefix           *bool             `json:"prefix,omitempty"` // for continue final message
@@ -2066,6 +2067,7 @@ func convertToOpenAIMessages(messages []Message) ([]openai.ChatCompletionMessage
 			ToolCalls:        msg.ToolCalls,
 			ToolCallID:       msg.ToolCallID,
 			ReasoningContent: msg.ReasoningContent,
+			Name:             msg.Name,
 		}
 		content := ""
 		if msg.Content != nil {
