@@ -1119,16 +1119,19 @@ func WrapperWrite(hdl unsafe.Pointer, req []comwrapper.WrapperData) (err error) 
 			continue // 跳过kv_info数据
 		}
 		// 适配流式请求
+		// 注意: v.Data 底层数组可能被上层复用, 必须拷贝而非直接引用/原地 append,
+		// 否则后续分片会踩到同一块内存, 造成内容错乱或串数据。
 		if v.Status != comwrapper.DataEnd {
-			if len(inst.streamContent) == 0 {
-				inst.streamContent = v.Data
-			} else {
-				inst.streamContent = append(inst.streamContent, v.Data...)
-			}
+			inst.streamContent = append(inst.streamContent, v.Data...)
 			continue
 		} else {
-			if inst.streamContent != nil {
-				v.Data = append(inst.streamContent, v.Data...)
+			if len(inst.streamContent) > 0 {
+				merged := make([]byte, 0, len(inst.streamContent)+len(v.Data))
+				merged = append(merged, inst.streamContent...)
+				merged = append(merged, v.Data...)
+				v.Data = merged
+				// 本次请求已拼接完成, 重置缓冲, 避免污染同一实例的后续请求
+				inst.streamContent = nil
 			}
 		}
 
